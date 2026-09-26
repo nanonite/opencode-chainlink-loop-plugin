@@ -1,9 +1,10 @@
 name: Publish
 
+# Manual only: this repo is a personal fork. Publishing would target the
+# upstream `@prevalentware/opencode-loop-plugin` package name, so it must be a
+# deliberate action (and the package name/scope changed) rather than a side
+# effect of pushing to main.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
