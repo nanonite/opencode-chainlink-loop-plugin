@@ -6,6 +6,7 @@ Thanks for your interest in improving `@prevalentware/opencode-loop-plugin`. Thi
 
 - [Bun](https://bun.sh) (the project is built, tested, and bundled with Bun)
 - An [OpenCode](https://opencode.ai) install if you want to try the plugin end to end
+- The `chainlink` CLI and a Chainlink issue database if you want to test issue orchestration
 
 ## Getting started
 
@@ -23,7 +24,7 @@ Useful scripts:
 | `bun test --coverage` | Run tests with a coverage report |
 | `bun run lint` | ESLint over the repo |
 | `bun run typecheck` | TypeScript `--noEmit` check |
-| `bun run build` | Bundle `src/server.ts` into `dist/` |
+| `bun run build` | Bundle the server and `chainlink-loop` CLI into `dist/` |
 | `bun run pack:dry-run` | Inspect the npm package contents |
 
 ## Project layout
@@ -32,8 +33,10 @@ Useful scripts:
 - `src/state.ts` — persistent loop state, interval parsing, lifecycle transitions.
 - `src/prompts.ts` — the `/loop` command template, iteration prompt, system reminder, and compaction context.
 - `src/tui.tsx` — terminal UI loop sidebar and command palette entry.
+- `src/chainlink.ts` — Chainlink issue selection and in-server worker/reviewer orchestration.
+- `src/chainlink-cli.ts`, `src/chainlink-process.ts`, and `src/chainlink-lock.ts` — the standalone `chainlink-loop` CLI, process execution, and workspace lock.
 - `test/` — Bun test suites mirroring the source modules.
-- `CONTEXT.md` — shared domain vocabulary for loop-mode behavior.
+- `CONTEXT.md` — shared vocabulary for loop and Chainlink behavior.
 
 ## Making changes
 
@@ -41,7 +44,7 @@ Useful scripts:
 2. Make your change, keeping the existing code style (no semicolons, 130-column lines, strict TypeScript).
 3. Add or update tests — behavior changes need regression coverage. Scheduler tests use 1-second intervals through the `min_interval_seconds` option.
 4. Run the local gates: `bun test && bun run lint && bun run typecheck && bun run build`.
-5. Commit the rebuilt `dist/server.js` when `src/server.ts` (or its imports) changed — the built file is tracked on purpose.
+5. Commit rebuilt `dist/server.js` or `dist/chainlink-loop.js` when their source modules change — the built files are tracked on purpose.
 6. Open a pull request against `main` describing the problem, the approach, and how you verified it. Link the related issue (`Closes #NN`) when one exists.
 
 ## CI and releases

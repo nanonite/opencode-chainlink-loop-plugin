@@ -4,7 +4,7 @@
 [![GitHub repository](https://img.shields.io/badge/GitHub-prevalentWare%2Fopencode--loop--plugin-blue?logo=github)](https://github.com/prevalentWare/opencode-loop-plugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-OpenCode Loop Plugin adds Claude Code-style `/loop` recurring prompts to OpenCode. It gives AI coding agents a `/loop` slash command backed by a persistent scheduler that re-injects an instruction into the session on an interval — or at agent-chosen delays — but only while the session is idle. Use it to babysit CI, watch a deploy, poll PR reviews, triage new issues, or keep any external state under watch without driving every check yourself.
+OpenCode Loop Plugin adds Claude Code-style `/loop` recurring prompts to OpenCode and integrates with Chainlink for issue-driven coding work. The `/loop` command uses a persistent scheduler to re-inject an instruction into an idle session on an interval or at agent-chosen delays. The `chainlink-loop` CLI selects Chainlink issues and runs a worker/reviewer cycle until each issue is approved or reaches its attempt limit.
 
 `/loop` is the complement to goal mode ([`@prevalentware/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin)): a goal defines when a task is *done*; a loop defines when to *wake the agent up again* to look at something that changes over time.
 
@@ -19,6 +19,7 @@ The OpenCode Loop Plugin adds:
 - Plan-mode safety: iterations are deferred while the session's last prompt came from a restricted agent (default: `plan`).
 - Compaction context so active loops are preserved when OpenCode summarizes a long session.
 - Safety rails: minimum interval, per-session loop limit, optional max runs, and automatic expiry after 7 days.
+- Chainlink integration: a `chainlink-loop` CLI for unattended issue queues, plus a `/chainlink` command and `run_chainlink_outer` tool on OpenCode 2.
 
 ## Install
 
@@ -105,6 +106,8 @@ Create a dynamic loop — the agent picks the delay between iterations based on 
 
 ### Chainlink: the deterministic loop (recommended)
 
+The published package includes the `chainlink-loop` executable. Install it with a package manager that puts its binaries on `PATH` (for example, `npm install -g @prevalentware/opencode-loop-plugin`), or run `bun run src/chainlink-cli.ts` from a checkout. Run it from the repository containing your Chainlink issues, with `chainlink` and `opencode` available on `PATH`. Set `CHAINLINK_DB` if the Chainlink database is outside that repository. The CLI uses the current working directory for both issue selection and worker changes.
+
 `chainlink-loop` runs the whole outer/inner loop with **no LLM in the control path**. Code picks the issue, counts the attempts and decides when to stop. Every step is a one-shot `opencode run` process, so each one has its own `--auto` permissions, its own agent, an exit code and a killable process tree.
 
 ```bash
@@ -127,9 +130,11 @@ bun run src/chainlink-cli.ts --task 67 --dry-run
 | `--max-tasks <n>` | Stop after this many tasks. |
 | `--no-close` | Leave approved issues open. Default is to close them. |
 | `--review-first auto\|always\|never` | Review work that already exists before dispatching a fresh worker (default `auto`). |
+| `--exclude <ids>` | Skip these issue subtrees when selecting ready tasks after an exhausted issue. |
 | `--worker-model` / `--reviewer-model` | `provider/model` per role. |
 | `--worker-agent` / `--reviewer-agent` | Defaults: `build` and `plan`. |
 | `--worker-timeout` / `--reviewer-timeout` | Per-step wall clock limit in seconds. |
+| `--dry-run` | Show the selected settings and, for one issue, whether existing work will be reviewed first. |
 
 The loop per task:
 
@@ -271,9 +276,9 @@ In OpenCode 2, use the plugin object form:
         "chainlink_stall_timeout_seconds": 300,
         "chainlink_child_permissions": "allow",
         "chainlink_close_completed_tasks": true,
-        "chainlink_db_path": "/mnt/sharedOs/handstand-workspace/.chainlink",
-        "chainlink_worker_model": "opencode-go/space-bunny-free",
-        "chainlink_reviewer_model": "opencode/space-bunny-free"
+        "chainlink_db_path": "/path/to/project/.chainlink",
+        "chainlink_worker_model": "provider/worker-model",
+        "chainlink_reviewer_model": "provider/reviewer-model"
       }
     }
   ]
