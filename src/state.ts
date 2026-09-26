@@ -36,9 +36,48 @@ export type Loop = {
   stopReason: string | null
 }
 
+export type ChainlinkWorkflowStatus = "running" | "completed" | "exhausted" | "failed" | "cancelled" | "interrupted"
+export type ChainlinkWorkflowPhase = "worker" | "reviewer" | "closing" | "done"
+
+export type ChainlinkWorkflow = {
+  id: string
+  ownerSessionID: string
+  taskID: string
+  taskTitle: string
+  taskJSON: string
+  ownerPid: number | null
+  status: ChainlinkWorkflowStatus
+  phase: ChainlinkWorkflowPhase
+  closed: boolean
+  attemptsUsed: number
+  maxAttempts: number
+  workerSessionID: string | null
+  reviewerSessionID: string | null
+  lastReviewJSON: string | null
+  lastError: string | null
+  createdAt: number
+  updatedAt: number
+  finishedAt: number | null
+  stopReason: string | null
+}
+
+export type ChainlinkWorkflowSnapshot = ChainlinkWorkflow & {
+  sampledAt: number
+}
+
+export type CreateChainlinkWorkflowOptions = {
+  ownerSessionID: string
+  taskID: string
+  taskTitle: string
+  taskJSON: string
+  maxAttempts: number
+  ownerPid?: number | null
+}
+
 type State = {
   version: 1
   loops: Record<string, Loop>
+  workflows: Record<string, ChainlinkWorkflow>
 }
 
 class StateReadError extends Data.TaggedError("StateReadError")<{
@@ -56,6 +95,7 @@ class StateWriteError extends Data.TaggedError("StateWriteError")<{
 export const DEFAULT_MIN_INTERVAL_SECONDS = 30
 export const DEFAULT_MAX_LOOPS_PER_SESSION = 5
 export const MAX_PROMPT_CHARS = 4000
+export const MAX_CHAINLINK_TASK_JSON_CHARS = 100_000
 const MAX_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000
 
 const NullableString = Schema.NullOr(Schema.String)
@@ -81,9 +121,33 @@ const LoopSchema = Schema.Struct({
   agent: Schema.optionalWith(NullableString, { default: () => null }),
   stopReason: Schema.optionalWith(NullableString, { default: () => null }),
 })
+const ChainlinkWorkflowSchema = Schema.Struct({
+  id: Schema.String,
+  ownerSessionID: Schema.String,
+  taskID: Schema.String,
+  taskTitle: Schema.String,
+  taskJSON: Schema.String,
+  ownerPid: Schema.optionalWith(NullableNumber, { default: () => null }),
+  status: Schema.Literal("running", "completed", "exhausted", "failed", "cancelled", "interrupted"),
+  phase: Schema.Literal("worker", "reviewer", "closing", "done"),
+  closed: Schema.optionalWith(Schema.Boolean, { default: () => false }),
+  attemptsUsed: Schema.Number,
+  maxAttempts: Schema.Number,
+  workerSessionID: NullableString,
+  reviewerSessionID: NullableString,
+  lastReviewJSON: NullableString,
+  lastError: NullableString,
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+  finishedAt: NullableNumber,
+  stopReason: NullableString,
+})
 const StateSchema = Schema.Struct({
   version: Schema.Literal(1),
   loops: Schema.Record({ key: Schema.String, value: LoopSchema }),
+  workflows: Schema.optionalWith(Schema.Record({ key: Schema.String, value: ChainlinkWorkflowSchema }), {
+    default: () => ({}),
+  }),
 })
 
 export type LoopSnapshot = Loop & {
@@ -94,7 +158,10 @@ function defaultStateFile() {
   const dataHome =
     process.env.XDG_DATA_HOME ||
     (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"))
-  return join(dataHome, "opencode-loop-plugin", "loops.json")
+  // Keep the workflow-aware state separate from legacy loop-plugin state.
+  // Older plugin processes decode and rewrite only `loops`, which would erase
+  // active Chainlink workflows if they shared the same file.
+  return join(dataHome, "opencode-loop-plugin", "loops-v2.json")
 }
 
 export function statePath() {
@@ -106,7 +173,7 @@ function now() {
 }
 
 function emptyState(): State {
-  return { version: 1, loops: {} }
+  return { version: 1, loops: {}, workflows: {} }
 }
 
 function isMissingStateFile(error: unknown) {
@@ -272,6 +339,27 @@ export function validatePrompt(prompt: string) {
   return value
 }
 
+function validateTaskID(value: string) {
+  const taskID = value.trim()
+  if (!taskID) throw new Error("Chainlink task id must not be empty")
+  if (taskID.length > 200) throw new Error("Chainlink task id is too long")
+  return taskID
+}
+
+function validateTaskJSON(value: string) {
+  const taskJSON = value.trim()
+  if (!taskJSON) throw new Error("Chainlink task JSON must not be empty")
+  if (taskJSON.length > MAX_CHAINLINK_TASK_JSON_CHARS) {
+    throw new Error(`Chainlink task JSON must be at most ${MAX_CHAINLINK_TASK_JSON_CHARS} characters`)
+  }
+  try {
+    JSON.parse(taskJSON)
+  } catch (error) {
+    throw new Error(`Chainlink task JSON is invalid: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+  }
+  return taskJSON
+}
+
 function positiveIntegerOrNull(value: unknown) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null
 }
@@ -284,12 +372,34 @@ export function snapshot(loop: Loop): LoopSnapshot {
   return { ...loop, sampledAt: now() }
 }
 
+export function workflowSnapshot(workflow: ChainlinkWorkflow): ChainlinkWorkflowSnapshot {
+  return { ...workflow, sampledAt: now() }
+}
+
 function requireLoop(state: State, loopID: string) {
   const loop = state.loops[loopID]
   if (!loop) throw new Error(`no loop found with id "${loopID}"`)
   return loop
 }
 
+/**
+ * Returns a workflow this process owns, taking it back first if another
+ * instance left a stale `interrupted` flag on it. Without this, a workflow that
+ * another process wrongly reclaimed would refuse every subsequent transition
+ * and the owner would throw away work that is already done.
+ */
+function requireOwnedWorkflow(state: State, workflowID: string): ChainlinkWorkflow {
+  const workflow: ChainlinkWorkflow | undefined = state.workflows[workflowID]
+  if (!workflow) throw new Error(`no Chainlink workflow found with id "${workflowID}"`)
+  if (workflow.status === "interrupted" && workflow.ownerPid === process.pid) {
+    workflow.status = "running"
+    workflow.phase = workflow.workerSessionID ? "reviewer" : "worker"
+    workflow.finishedAt = null
+    workflow.stopReason = null
+    workflow.updatedAt = now()
+  }
+  return workflow
+}
 export async function createLoop(sessionID: string, options: CreateLoopOptions) {
   const prompt = validatePrompt(options.prompt)
   const mode: LoopMode = options.mode === "dynamic" ? "dynamic" : "interval"
@@ -334,6 +444,267 @@ export async function getLoop(loopID: string) {
   const state = await readState()
   const loop = state.loops[loopID]
   return loop ? snapshot(loop) : null
+}
+
+export async function createChainlinkWorkflow(options: CreateChainlinkWorkflowOptions) {
+  const taskID = validateTaskID(options.taskID)
+  const taskTitle = options.taskTitle.trim() || taskID
+  const taskJSON = validateTaskJSON(options.taskJSON)
+  const maxAttempts = positiveIntegerOrNull(options.maxAttempts)
+  if (maxAttempts == null) throw new Error("Chainlink workflow requires a positive maxAttempts")
+  return mutate((state) => {
+    const duplicate = Object.values(state.workflows).find(
+      (workflow) => workflow.taskID === taskID && workflow.ownerSessionID === options.ownerSessionID && workflow.status === "running",
+    )
+    if (duplicate) throw new Error(`Chainlink task ${taskID} already has an active workflow (${duplicate.id})`)
+    let id = `chainlink_${generateLoopID().slice("loop_".length)}`
+    while (state.workflows[id]) id = `chainlink_${generateLoopID().slice("loop_".length)}`
+    const timestamp = now()
+    const workflow: ChainlinkWorkflow = {
+      id,
+      ownerSessionID: options.ownerSessionID,
+      taskID,
+      taskTitle,
+      taskJSON,
+      ownerPid: options.ownerPid ?? process.pid,
+      status: "running",
+      phase: "worker",
+      closed: false,
+      attemptsUsed: 0,
+      maxAttempts,
+      workerSessionID: null,
+      reviewerSessionID: null,
+      lastReviewJSON: null,
+      lastError: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      finishedAt: null,
+      stopReason: null,
+    }
+    state.workflows[id] = workflow
+    return workflowSnapshot(workflow)
+  })
+}
+
+export async function getChainlinkWorkflow(workflowID: string) {
+  const state = await readState()
+  const workflow = state.workflows[workflowID]
+  return workflow ? workflowSnapshot(workflow) : null
+}
+
+export async function listChainlinkWorkflows(ownerSessionID?: string) {
+  const state = await readState()
+  return Object.values(state.workflows)
+    .filter((workflow) => ownerSessionID == null || workflow.ownerSessionID === ownerSessionID)
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .map(workflowSnapshot)
+}
+
+export async function listActiveChainlinkWorkflows(ownerSessionID?: string) {
+  return (await listChainlinkWorkflows(ownerSessionID)).filter((workflow) => workflow.status === "running")
+}
+
+export async function recordChainlinkWorkerStarted(workflowID: string, workerSessionID: string) {
+  return mutate((state) => {
+    const workflow = requireOwnedWorkflow(state, workflowID)
+    if (workflow.status !== "running") throw new Error(`Chainlink workflow "${workflowID}" is ${workflow.status}`)
+    if (workflow.phase !== "worker") throw new Error(`Chainlink workflow "${workflowID}" is in phase ${workflow.phase}`)
+    workflow.workerSessionID = workerSessionID
+    workflow.attemptsUsed = Math.max(1, workflow.attemptsUsed + (workflow.workerSessionID ? 0 : 1))
+    workflow.updatedAt = now()
+    return workflowSnapshot(workflow)
+  })
+}
+
+export async function recordChainlinkWorkerStall(workflowID: string) {
+  return mutate((state) => {
+    const workflow = requireOwnedWorkflow(state, workflowID)
+    if (workflow.status !== "running") return workflowSnapshot(workflow)
+    if (workflow.phase !== "worker") throw new Error(`Chainlink workflow "${workflowID}" is in phase ${workflow.phase}`)
+    workflow.attemptsUsed += 1
+    workflow.updatedAt = now()
+    return workflowSnapshot(workflow)
+  })
+}
+
+export async function recordChainlinkReviewerStarted(workflowID: string, reviewerSessionID: string) {
+  return mutate((state) => {
+    const workflow = requireOwnedWorkflow(state, workflowID)
+    if (workflow.status !== "running") throw new Error(`Chainlink workflow "${workflowID}" is ${workflow.status}`)
+    workflow.phase = "reviewer"
+    workflow.reviewerSessionID = reviewerSessionID
+    workflow.updatedAt = now()
+    return workflowSnapshot(workflow)
+  })
+}
+
+export async function recordChainlinkReview(
+  workflowID: string,
+  reviewerSessionID: string,
+  reviewJSON: string,
+  attemptsUsed: number,
+) {
+  return mutate((state) => {
+    const workflow = requireOwnedWorkflow(state, workflowID)
+    if (workflow.status !== "running") throw new Error(`Chainlink workflow "${workflowID}" is ${workflow.status}`)
+    if (workflow.phase !== "reviewer") throw new Error(`Chainlink workflow "${workflowID}" is in phase ${workflow.phase}`)
+    workflow.reviewerSessionID = reviewerSessionID
+    workflow.lastReviewJSON = reviewJSON.slice(0, MAX_CHAINLINK_TASK_JSON_CHARS)
+    workflow.attemptsUsed = Math.max(workflow.attemptsUsed, attemptsUsed)
+    workflow.phase = "worker"
+    workflow.updatedAt = now()
+    return workflowSnapshot(workflow)
+  })
+}
+
+export async function recordChainlinkClosing(workflowID: string) {
+  return mutate((state) => {
+    const workflow = requireOwnedWorkflow(state, workflowID)
+    if (workflow.status !== "running") throw new Error(`Chainlink workflow "${workflowID}" is ${workflow.status}`)
+    workflow.phase = "closing"
+    workflow.updatedAt = now()
+    return workflowSnapshot(workflow)
+  })
+}
+
+export async function finishChainlinkWorkflow(
+  workflowID: string,
+  status: Exclude<ChainlinkWorkflowStatus, "running">,
+  reason?: string | null,
+  closed = false,
+) {
+  return mutate((state) => {
+    const workflow = requireOwnedWorkflow(state, workflowID)
+    if (workflow.status !== "running") return workflowSnapshot(workflow)
+    const timestamp = now()
+    workflow.status = status
+    workflow.phase = "done"
+    workflow.closed = closed
+    workflow.finishedAt = timestamp
+    workflow.updatedAt = timestamp
+    workflow.stopReason = typeof reason === "string" && reason.trim() ? reason.trim().slice(0, 400) : null
+    return workflowSnapshot(workflow)
+  })
+}
+
+export async function failChainlinkWorkflow(workflowID: string, error: string) {
+  return mutate((state) => {
+    const workflow = requireOwnedWorkflow(state, workflowID)
+    if (workflow.status !== "running") return workflowSnapshot(workflow)
+    const timestamp = now()
+    workflow.status = "failed"
+    workflow.phase = "done"
+    workflow.lastError = error.slice(0, 400)
+    workflow.finishedAt = timestamp
+    workflow.updatedAt = timestamp
+    workflow.stopReason = error.slice(0, 400)
+    return workflowSnapshot(workflow)
+  })
+}
+
+export async function stopChainlinkWorkflowsForSession(sessionID: string, reason: string) {
+  return mutate((state) => {
+    const stopped: ChainlinkWorkflowSnapshot[] = []
+    for (const workflow of Object.values(state.workflows)) {
+      if (workflow.status !== "running") continue
+      if (
+        workflow.ownerSessionID !== sessionID &&
+        workflow.workerSessionID !== sessionID &&
+        workflow.reviewerSessionID !== sessionID
+      ) {
+        continue
+      }
+      const timestamp = now()
+      workflow.status = sessionID === workflow.ownerSessionID ? "cancelled" : "interrupted"
+      workflow.phase = "done"
+      workflow.finishedAt = timestamp
+      workflow.updatedAt = timestamp
+      workflow.stopReason = reason.slice(0, 400)
+      stopped.push(workflowSnapshot(workflow))
+    }
+    return stopped
+  })
+}
+
+function defaultIsProcessAlive(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Marks running workflows as interrupted when their owning process is gone.
+ *
+ * Ownership is decided purely by liveness, never by pid equality: OpenCode can
+ * run plugin `setup` more than once per process, so an "own pid" rule would let a
+ * later setup interrupt a workflow that is still running in this very process.
+ * Workflows without an `ownerPid` predate ownership tracking and cannot be
+ * verified, so they are treated as abandoned.
+ */
+export async function interruptActiveChainlinkWorkflows(
+  reason: string,
+  options: { isProcessAlive?: (pid: number) => boolean } = {},
+) {
+  const isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive
+  return mutate((state) => {
+    const interrupted: ChainlinkWorkflowSnapshot[] = []
+    for (const workflow of Object.values(state.workflows)) {
+      if (workflow.status !== "running") continue
+      if (workflow.ownerPid != null && isProcessAlive(workflow.ownerPid)) continue
+      const timestamp = now()
+      workflow.status = "interrupted"
+      workflow.phase = "done"
+      workflow.finishedAt = timestamp
+      workflow.updatedAt = timestamp
+      workflow.stopReason = reason.slice(0, 400)
+      interrupted.push(workflowSnapshot(workflow))
+    }
+    return interrupted
+  })
+}
+
+/**
+ * Takes a workflow back from a stale `interrupted` flag when this process still
+ * owns it. Another instance can mark a live workflow interrupted; the worker
+ * that is mid-flight should keep going to review instead of discarding its work.
+ */
+export async function reclaimChainlinkWorkflow(workflowID: string, ownerPid = process.pid) {
+  return mutate((state) => {
+    const workflow = state.workflows[workflowID]
+    if (!workflow) return null
+    if (workflow.status !== "interrupted" || workflow.ownerPid !== ownerPid) return workflowSnapshot(workflow)
+    workflow.status = "running"
+    workflow.phase = workflow.workerSessionID ? "reviewer" : "worker"
+    workflow.finishedAt = null
+    workflow.stopReason = null
+    workflow.updatedAt = now()
+    return workflowSnapshot(workflow)
+  })
+}
+
+/**
+ * Marks only this process's running workflows as interrupted. Called when the
+ * plugin is torn down, so a reload or shutdown records the outcome instead of
+ * leaving a workflow that nothing will ever finish.
+ */export async function interruptChainlinkWorkflowsOwnedBy(ownerPid: number, reason: string) {
+  return mutate((state) => {
+    const interrupted: ChainlinkWorkflowSnapshot[] = []
+    for (const workflow of Object.values(state.workflows)) {
+      if (workflow.status !== "running") continue
+      if (workflow.ownerPid !== ownerPid) continue
+      const timestamp = now()
+      workflow.status = "interrupted"
+      workflow.phase = "done"
+      workflow.finishedAt = timestamp
+      workflow.updatedAt = timestamp
+      workflow.stopReason = reason.slice(0, 400)
+      interrupted.push(workflowSnapshot(workflow))
+    }
+    return interrupted
+  })
 }
 
 export async function claimDueRun(loopID: string, leaseMs: number) {

@@ -5,6 +5,56 @@ function escapeXmlText(input: string) {
   return input.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
 }
 
+export type ParsedChainlinkArguments = {
+  task_ids: string[] | null
+  max_attempts: number
+  close_on_approval: boolean
+}
+
+export function parseChainlinkArguments(text: string, defaultMaxAttempts: number): ParsedChainlinkArguments {
+  const tokens = text.trim().split(/\s+/).filter(Boolean)
+  const taskIDs: string[] = []
+  let maxAttempts = defaultMaxAttempts
+  let closeOnApproval = true
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!
+    if (token === "task" || token === "tasks") continue
+    if (token === "--no-close") {
+      closeOnApproval = false
+      continue
+    }
+    if (token === "--attempts") {
+      const value = Number(tokens[++index])
+      if (!Number.isSafeInteger(value) || value < 1 || value > 100) {
+        throw new Error("--attempts requires an integer from 1 to 100")
+      }
+      maxAttempts = value
+      continue
+    }
+    const normalized = token.startsWith("#") ? token.slice(1) : token
+    if (!/^\d+$/.test(normalized)) {
+      throw new Error(`unrecognized /chainlink argument "${token}"; use #id, task id, --attempts N, or --no-close`)
+    }
+    taskIDs.push(normalized)
+  }
+  return { task_ids: taskIDs.length > 0 ? taskIDs : null, max_attempts: maxAttempts, close_on_approval: closeOnApproval }
+}
+
+export function chainlinkCommandTemplate(commandName: string, defaultMaxAttempts: number) {
+  return `OpenCode Chainlink orchestration command "/${commandName}" was invoked.
+
+Arguments:
+<chainlink_command_arguments>
+$ARGUMENTS
+</chainlink_command_arguments>
+
+Call the \`run_chainlink_outer\` tool exactly once. Do not run \`chainlink\` yourself, do not create ordinary loop records, and do not perform the task in this command turn. The tool owns the outer loop and the inner worker/reviewer loop. The command adapter has already parsed the arguments; pass the exact \`Deterministic tool input\` JSON below to the tool. Usage: \`/chainlink [#id ...] [--attempts N] [--no-close]\`.
+
+The outer loop repeatedly asks Chainlink for the next actionable task and stops when no task is available. For each task, the tool reuses one worker session, creates a fresh reviewer session for each attempt, feeds the review back to the worker, and stops at the attempt limit (default ${defaultMaxAttempts}) or reviewer approval.
+
+Report the tool's status, task count, and workflow results.`
+}
+
 export function loopCommandTemplate(commandName: string, minIntervalSeconds: number) {
   return `OpenCode loop mode command "/${commandName}" was invoked.
 

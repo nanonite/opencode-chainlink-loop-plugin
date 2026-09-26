@@ -36,7 +36,11 @@
       "import": "./src/tui.tsx"
     }
   },
+  "bin": {
+    "chainlink-loop": "./bin/chainlink-loop"
+  },
   "files": [
+    "bin",
     "dist",
     "src/tui.tsx",
     "LICENSE",
@@ -44,7 +48,9 @@
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "bun run clean && bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --external effect --external zod",
+    "build": "bun run clean && bun run build:server && bun run build:cli",
+    "build:server": "bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --external effect --external zod",
+    "build:cli": "bun build ./src/chainlink-cli.ts --outfile ./dist/chainlink-loop.js --target bun --external effect --external zod",
     "ci:version": "bun scripts/resolve-ci-version.ts",
     "lint": "eslint .",
     "pack:dry-run": "npm pack --dry-run",

@@ -11,6 +11,7 @@ const TOOL_NAMES = [
   "list_loops",
   "pause_loop",
   "resume_loop",
+  "run_chainlink_outer",
   "run_loop",
   "schedule_next_run",
   "stop_loop",
@@ -107,6 +108,9 @@ type MockContext = {
   event: {
     subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<unknown>
   }
+  permission: {
+    hook: (name: string, callback: (input: unknown) => void) => Promise<Registration>
+  }
 }
 
 function makeMockContext(options: Record<string, unknown> = {}): MockContext {
@@ -156,6 +160,12 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
     },
     event: {
       subscribe: () => stream,
+    },
+    permission: {
+      hook: async (name, callback) => {
+        hooks[`permission:${name}`] = callback
+        return registration(`permission.hook:${name}`)
+      },
     },
   }
 }

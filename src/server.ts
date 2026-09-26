@@ -3,6 +3,7 @@ import type * as PluginV2 from "@opencode-ai/plugin-v2"
 import type { Info as ToolV2Info } from "@opencode-ai/plugin-v2/promise/tool"
 import type { Tool as ToolSchema } from "@opencode-ai/schema/tool"
 import { z } from "zod"
+import { execChainlinkCommand, parseChildPermissionPolicy, parseModelRef, runChainlinkOuter, type ChainlinkChildRegistry } from "./chainlink"
 import {
   DEFAULT_MAX_LOOPS_PER_SESSION,
   DEFAULT_MIN_INTERVAL_SECONDS,
@@ -21,12 +22,22 @@ import {
   scheduleNextRun,
   stopLoop,
   stopLoopsForSession,
+  stopChainlinkWorkflowsForSession,
+  interruptActiveChainlinkWorkflows,
+  interruptChainlinkWorkflowsOwnedBy,
   recordRunDeferred,
   recordRunFailed,
   recordRunSent,
   type LoopSnapshot,
 } from "./state"
-import { compactionContext, iterationPrompt, loopCommandTemplate, systemReminder } from "./prompts"
+import {
+  chainlinkCommandTemplate,
+  compactionContext,
+  parseChainlinkArguments,
+  iterationPrompt,
+  loopCommandTemplate,
+  systemReminder,
+} from "./prompts"
 
 type Options = {
   register_command?: boolean
@@ -38,6 +49,24 @@ type Options = {
   max_loop_age_days?: number
   dynamic_max_delay_seconds?: number
   restricted_agents?: string[]
+  chainlink_command_name?: string
+  chainlink_next_args?: string[]
+  /** Legacy alias for chainlink_next_args. */
+  chainlink_ready_args?: string[]
+  chainlink_show_args?: string[]
+  chainlink_close_args?: string[]
+  chainlink_max_attempts?: number
+  chainlink_max_tasks?: number | null
+  chainlink_worker_agent?: string
+  chainlink_reviewer_agent?: string
+  chainlink_worker_timeout_seconds?: number
+  chainlink_reviewer_timeout_seconds?: number
+  chainlink_stall_timeout_seconds?: number
+  chainlink_child_permissions?: "allow" | "deny" | "ask" | "inherit"
+  chainlink_close_completed_tasks?: boolean
+  chainlink_db_path?: string
+  chainlink_worker_model?: string
+  chainlink_reviewer_model?: string
 }
 
 const DEFAULT_COMMAND_NAME = "loop"
@@ -45,6 +74,13 @@ const DEFAULT_BUSY_BACKOFF_SECONDS = 60
 const DEFAULT_FAILURE_BACKOFF_SECONDS = 60
 const DEFAULT_MAX_LOOP_AGE_DAYS = 7
 const DEFAULT_DYNAMIC_MAX_DELAY_SECONDS = 24 * 60 * 60
+const DEFAULT_CHAINLINK_COMMAND_NAME = "chainlink"
+const DEFAULT_CHAINLINK_MAX_ATTEMPTS = 20
+const DEFAULT_CHAINLINK_WORKER_AGENT = "build"
+const DEFAULT_CHAINLINK_REVIEWER_AGENT = "plan"
+const DEFAULT_CHAINLINK_WORKER_TIMEOUT_SECONDS = 3_600
+const DEFAULT_CHAINLINK_REVIEWER_TIMEOUT_SECONDS = 1_800
+const DEFAULT_CHAINLINK_STALL_TIMEOUT_SECONDS = 300
 const RUN_CLAIM_LEASE_MS = 30_000
 const DEFAULT_RESTRICTED_AGENTS = ["plan"]
 const LOOP_SYSTEM_MARKER = "OpenCode loop mode"
@@ -53,6 +89,27 @@ function commandNameFromOptions(options?: Options) {
   const name = options?.command_name?.trim() || DEFAULT_COMMAND_NAME
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return DEFAULT_COMMAND_NAME
   return name
+}
+
+function chainlinkCommandNameFromOptions(options?: Options) {
+  const name = options?.chainlink_command_name?.trim() || DEFAULT_CHAINLINK_COMMAND_NAME
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return DEFAULT_CHAINLINK_COMMAND_NAME
+  return name
+}
+
+function stringArrayOr(value: unknown, fallback: string[]) {
+  if (!Array.isArray(value) || value.length === 0 || value.some((item) => typeof item !== "string" || !item.trim())) {
+    return fallback
+  }
+  return value.map((item) => item.trim())
+}
+
+function agentNameOr(value: unknown, fallback: string) {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback
+}
+
+function boundedPositiveNumberOr(value: unknown, fallback: number, max: number) {
+  return Math.min(max, Math.max(1, Math.round(positiveNumberOr(value, fallback))))
 }
 
 function positiveNumberOr(value: unknown, fallback: number) {
@@ -535,6 +592,39 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const failureBackoffMs = positiveNumberOr(options.failure_backoff_seconds, DEFAULT_FAILURE_BACKOFF_SECONDS) * 1000
   const maxLoopAgeMs = nonNegativeNumberOr(options.max_loop_age_days, DEFAULT_MAX_LOOP_AGE_DAYS) * 24 * 60 * 60 * 1000
   const dynamicMaxDelaySeconds = positiveNumberOr(options.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS)
+  const chainlinkCommandName = chainlinkCommandNameFromOptions(options)
+  const chainlinkMaxAttempts = boundedPositiveNumberOr(options.chainlink_max_attempts, DEFAULT_CHAINLINK_MAX_ATTEMPTS, 100)
+  const chainlinkMaxTasks = options.chainlink_max_tasks == null ? null : boundedPositiveNumberOr(options.chainlink_max_tasks, 1, 10_000)
+  const chainlinkWorkerAgent = agentNameOr(options.chainlink_worker_agent, DEFAULT_CHAINLINK_WORKER_AGENT)
+  const chainlinkReviewerAgent = agentNameOr(options.chainlink_reviewer_agent, DEFAULT_CHAINLINK_REVIEWER_AGENT)
+  const chainlinkWorkerTimeoutSeconds = boundedPositiveNumberOr(
+    options.chainlink_worker_timeout_seconds,
+    DEFAULT_CHAINLINK_WORKER_TIMEOUT_SECONDS,
+    86_400,
+  )
+  const chainlinkReviewerTimeoutSeconds = boundedPositiveNumberOr(
+    options.chainlink_reviewer_timeout_seconds,
+    DEFAULT_CHAINLINK_REVIEWER_TIMEOUT_SECONDS,
+    86_400,
+  )
+  const chainlinkStallTimeoutSeconds = boundedPositiveNumberOr(
+    options.chainlink_stall_timeout_seconds,
+    DEFAULT_CHAINLINK_STALL_TIMEOUT_SECONDS,
+    86_400,
+  )
+  const chainlinkChildPermissions = parseChildPermissionPolicy(options.chainlink_child_permissions)
+  const chainlinkNextArgs = stringArrayOr(
+    options.chainlink_next_args,
+    stringArrayOr(options.chainlink_ready_args, ["issue", "next", "--json"]),
+  )
+  const chainlinkShowArgs = stringArrayOr(options.chainlink_show_args, ["issue", "show", "--json"])
+  const chainlinkCloseArgs = stringArrayOr(options.chainlink_close_args, ["issue", "close", "--json"])
+  const chainlinkCloseCompletedTasks = options.chainlink_close_completed_tasks ?? true
+  const chainlinkDbPath = typeof options.chainlink_db_path === "string" && options.chainlink_db_path.trim()
+    ? options.chainlink_db_path.trim()
+    : process.env.CHAINLINK_DB || null
+  const chainlinkWorkerModel = options.chainlink_worker_model || null
+  const chainlinkReviewerModel = options.chainlink_reviewer_model || null
   const restrictedAgents = restrictedAgentSet(options)
 
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -548,7 +638,14 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   // Dynamic loops whose latest injected (or creating) turn has not yet gone idle:
   // if that turn ends without schedule_next_run or stop_loop, the loop ends.
   const dynamicPending = new Map<string, { sessionID: string; sawBusy: boolean }>()
+  const chainlinkAbortController = new AbortController()
   const registrations: Array<{ dispose(): Promise<void> }> = []
+  // Every live Chainlink run contributes a registry of its child sessions. The
+  // permission.ask hook consults them so a child can never block on a request
+  // that nobody is there to answer.
+  const chainlinkRegistries = new Set<ChainlinkChildRegistry>()
+  // sessionID -> messageID of the turn that already invoked the outer loop.
+  const chainlinkInvocations = new Map<string, string>()
 
   const isRestrictedAgent = (agent: string | null | undefined) =>
     typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase())
@@ -744,6 +841,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           cancelTimer(loop.id)
           dynamicPending.delete(loop.id)
         }
+        await stopChainlinkWorkflowsForSession(sessionID, "session deleted")
         return
       }
       case "session.agent.selected": {
@@ -790,6 +888,37 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             })
           },
         })
+        draft.add({
+          name: chainlinkCommandName,
+          description: "Process the next actionable Chainlink tasks with worker and reviewer agents",
+          execute: async (input) => {
+            const stripMention = <T extends { mention?: unknown }>({ mention: _mention, ...attachment }: T) => attachment
+            const parsed = parseChainlinkArguments(input.prompt.text, chainlinkMaxAttempts)
+            const parsedInput = JSON.stringify(parsed)
+            const template = chainlinkCommandTemplate(chainlinkCommandName, chainlinkMaxAttempts).replaceAll(
+              "$ARGUMENTS",
+              () => input.prompt.text.trim(),
+            )
+            v2Log("info", "Chainlink command handler invoked", {
+              sessionID: input.sessionID,
+              delivery: input.delivery,
+              raw: input.prompt.text.slice(0, 200),
+            })
+            await context.session.prompt({
+              ...input.prompt,
+              files: input.prompt.files?.map(stripMention),
+              agents: input.prompt.agents?.map(stripMention),
+              skills: input.prompt.skills?.map(stripMention),
+              sessionID: input.sessionID,
+              text: `${template}\n\nDeterministic tool input parsed by the command adapter:\n${parsedInput}\n\nCall run_chainlink_outer exactly once with exactly this JSON input.`,
+              delivery: input.delivery,
+            })
+            v2Log("info", "Chainlink command handler delivered template", {
+              sessionID: input.sessionID,
+              delivery: input.delivery,
+            })
+          },
+        })
       }),
     )
   }
@@ -797,6 +926,126 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   registrations.push(
     await context.tool.transform((draft) => {
       for (const tool of loopToolsV2(services)) draft.add(tool)
+      draft.add({
+        name: "run_chainlink_outer",
+        description:
+          "Run the Chainlink outer loop: fetch one next actionable task at a time, then run its worker/reviewer inner loop until approval, exhaustion, or no tasks remain.",
+        input: v2ObjectSchema({
+          task_ids: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+            maxItems: 100,
+            description: "Optional explicit Chainlink issue IDs to process, in order. Omit to drain the next queue.",
+          },
+          exclude_task_ids: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+            maxItems: 100,
+            description:
+              "Issue ids whose subtrees the queue must not enter. Needed when a project deliberately holds a subtree back: `issue next` honours that, but the fallback used to step past an exhausted task does not.",
+          },
+          max_attempts: {
+            type: "integer",
+            minimum: 1,
+            maximum: 100,
+            description: "Per-run worker/reviewer attempt limit.",
+          },
+          stall_timeout_seconds: {
+            type: "integer",
+            minimum: 1,
+            maximum: 86400,
+            description: "Abort and re-prompt a child after this many seconds without any session activity.",
+          },
+          close_on_approval: {
+            type: "boolean",
+            description: "Whether approved tasks should be closed in Chainlink. Defaults to the plugin option.",
+          },
+          worker_model: {
+            type: "string",
+            description: "Optional worker model reference in provider/model form.",
+          },
+          reviewer_model: {
+            type: "string",
+            description: "Optional reviewer model reference in provider/model form.",
+          },
+        }),
+        options: { codemode: false },
+        execute: async (args, toolContext) => {
+          const input = args as {
+            task_ids?: string[]
+            exclude_task_ids?: string[]
+            max_attempts?: number
+            stall_timeout_seconds?: number
+            close_on_approval?: boolean
+            worker_model?: string
+            reviewer_model?: string
+          }
+          observedSessions.add(toolContext.sessionID)
+          // The contract is "call this exactly once per turn". A model that
+          // ignores the command template and retries would otherwise start a
+          // second workflow on top of the first.
+          const previousTurn = chainlinkInvocations.get(toolContext.sessionID)
+          if (previousTurn && previousTurn === toolContext.messageID) {
+            return {
+              content: JSON.stringify(
+                {
+                  status: "refused",
+                  error:
+                    `run_chainlink_outer was already called in this turn (session ${toolContext.sessionID}, message ${toolContext.messageID}). ` +
+                    "Start no further workflow. Report the first result and end the turn.",
+                },
+                null,
+                2,
+              ),
+            }
+          }
+          chainlinkInvocations.set(toolContext.sessionID, toolContext.messageID)
+          const result = await runChainlinkOuter(context, {
+            ownerSessionID: toolContext.sessionID,
+            cwd: context.location.directory,
+            selectionArgs: chainlinkNextArgs,
+            taskIds: input.task_ids ?? null,
+            showArgs: chainlinkShowArgs,
+            closeArgs: chainlinkCloseArgs,
+            maxAttempts: boundedPositiveNumberOr(input.max_attempts ?? chainlinkMaxAttempts, chainlinkMaxAttempts, 100),
+            maxTasks: chainlinkMaxTasks,
+            stallTimeoutSeconds: boundedPositiveNumberOr(
+              input.stall_timeout_seconds ?? chainlinkStallTimeoutSeconds,
+              chainlinkStallTimeoutSeconds,
+              86_400,
+            ),
+            closeOnApproval: input.close_on_approval ?? chainlinkCloseCompletedTasks,
+            excludeTaskIDs: input.exclude_task_ids ?? [],
+            workerModel: parseModelRef(input.worker_model ?? chainlinkWorkerModel),
+            reviewerModel: parseModelRef(input.reviewer_model ?? chainlinkReviewerModel),
+            dbPath: chainlinkDbPath,
+            workerAgent: chainlinkWorkerAgent,
+            reviewerAgent: chainlinkReviewerAgent,
+            workerTimeoutSeconds: chainlinkWorkerTimeoutSeconds,
+            reviewerTimeoutSeconds: chainlinkReviewerTimeoutSeconds,
+            runner: execChainlinkCommand,
+            signal: chainlinkAbortController.signal,
+            childPermissions: chainlinkChildPermissions,
+            onChildRegistry: (registry) => {
+              chainlinkRegistries.add(registry)
+            },
+          })
+          chainlinkRegistries.clear()
+          return {
+            content: JSON.stringify(
+              {
+                ...result,
+                ...(result.status === "failed" || result.status === "exhausted"
+                  ? { orchestrator_instruction: "Do not continue the task yourself. Report this result and end the turn." }
+                  : {}),
+                loops: await listLoops(toolContext.sessionID),
+              },
+              null,
+              2,
+            ),
+          }
+        },
+      })
     }),
   )
 
@@ -812,6 +1061,43 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   await rehydrate().catch((error) =>
     v2Log("error", "Failed to rehydrate loops", { error: error instanceof Error ? error.message : String(error) }),
+  )
+  // Only reclaim workflows whose owning process is gone. A live owner is never
+  // interrupted here: OpenCode may call setup again inside the same process, and
+  // that must not cancel a run that is still in flight.
+  await interruptActiveChainlinkWorkflows("Chainlink owner process exited before the workflow finished")
+    .then((reclaimed) => {
+      if (reclaimed.length) {
+        v2Log("info", "Reclaimed abandoned Chainlink workflows", {
+          currentPid: process.pid,
+          count: reclaimed.length,
+          workflowIDs: reclaimed.map((workflow) => workflow.id),
+          taskIDs: reclaimed.map((workflow) => workflow.taskID),
+        })
+      }
+    })
+    .catch((error) =>
+      v2Log("error", "Failed to mark interrupted Chainlink workflows", {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    )
+
+  registrations.push(
+    await context.permission.hook("evaluate", (evaluation) => {
+      for (const registry of chainlinkRegistries) {
+        if (!registry.isChild(evaluation.sessionID)) continue
+        const decision = registry.decide(evaluation.sessionID, evaluation.action)
+        v2Log("info", "Answered Chainlink child permission request", {
+          sessionID: evaluation.sessionID,
+          role: registry.role(evaluation.sessionID),
+          action: evaluation.action,
+          resources: evaluation.resources,
+          decision,
+        })
+        if (decision !== "ask") evaluation.effect = decision
+        return
+      }
+    }),
   )
 
   const abortController = new AbortController()
@@ -835,6 +1121,15 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   return async () => {
     abortController.abort()
+    chainlinkAbortController.abort()
+    await interruptChainlinkWorkflowsOwnedBy(
+      process.pid,
+      "Chainlink plugin unloaded before the workflow finished",
+    ).catch((error) =>
+      v2Log("error", "Failed to release Chainlink workflows on unload", {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    )
     for (const timer of timers.values()) clearTimeout(timer)
     timers.clear()
     dynamicPending.clear()

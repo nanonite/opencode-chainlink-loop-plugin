@@ -103,6 +103,95 @@ Create a dynamic loop — the agent picks the delay between iterations based on 
 /loop watch the staging deploy and run smoke checks when it finishes
 ```
 
+### Chainlink: the deterministic loop (recommended)
+
+`chainlink-loop` runs the whole outer/inner loop with **no LLM in the control path**. Code picks the issue, counts the attempts and decides when to stop. Every step is a one-shot `opencode run` process, so each one has its own `--auto` permissions, its own agent, an exit code and a killable process tree.
+
+```bash
+# drain the queue
+chainlink-loop
+
+# one issue, several in order, leave them open
+chainlink-loop --task 67
+chainlink-loop --task 12,71 --no-close
+chainlink-loop --attempts 5 --max-tasks 3
+
+# from a checkout, without installing the bin
+bun run src/chainlink-cli.ts --task 67 --dry-run
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--task <ids>` | Comma-separated issue ids. `#67` is accepted and normalised to `67`. |
+| `--attempts <n>` | Per-task attempt limit (default 20). |
+| `--max-tasks <n>` | Stop after this many tasks. |
+| `--no-close` | Leave approved issues open. Default is to close them. |
+| `--review-first auto\|always\|never` | Review work that already exists before dispatching a fresh worker (default `auto`). |
+| `--worker-model` / `--reviewer-model` | `provider/model` per role. |
+| `--worker-agent` / `--reviewer-agent` | Defaults: `build` and `plan`. |
+| `--worker-timeout` / `--reviewer-timeout` | Per-step wall clock limit in seconds. |
+
+The loop per task:
+
+1. `opencode run --standalone --auto --agent build "<issue spec>"` — a fresh worker process.
+2. `opencode run --standalone --auto --agent plan "<review prompt>"` — a fresh reviewer process that returns the verdict JSON. The `plan` agent cannot write outside its plan directory, so a reviewer cannot edit the tree even under `--auto`; the plugin also denies edit/write/patch requests raised by a reviewer session.
+3. If not approved, the findings go back to the **same worker session** via `--session <id>`, so context is kept. Repeat until approval or the attempt limit.
+4. Close the issue only on approval and only when closing is enabled.
+
+`--review-first auto` looks for a dirty tree, commits that mention the issue, a previous Chainlink workflow for the same task, or comments on the issue. If any are found, the reviewer runs **first** so a previous attempt's work is judged rather than thrown away.
+
+**One loop per workspace.** The loop takes a lock keyed by working directory and `CHAINLINK_DB` (`$TMPDIR/chainlink-loop-*.lock`) so a second invocation fails loudly instead of dispatching two workers at the same files. A lock whose owning process is gone is taken over automatically. `SIGINT`/`SIGTERM` stop the loop, kill the in-flight step's process group, and release the lock; a second signal exits immediately.
+
+**Exhausted tasks are skipped, not fatal.** A task that burns its attempt limit is left open for a human and the loop moves on to the next ready leaf. Because `issue next` keeps returning the same still-open task, the loop falls back to `issue ready --json` and picks the first leaf it has not touched. That fallback does **not** know about a project which deliberately holds a subtree back, so use `--exclude <ids>` for those — for example `--exclude 1` to keep the queue out of a "upstream reports" epic whose children wait on a human.
+
+### `/chainlink` and the `run_chainlink_outer` tool (in-server)
+
+The V2 plugin also registers a `/chainlink` command and a `run_chainlink_outer` tool that run the same loop using in-server child sessions.
+
+> **Known limitation (OpenCode 2.0.16).** The command handler is registered but its `execute` callback is never invoked by this build, so the model receives the raw text `/chainlink` instead of the instruction template. Anything typed after it is then interpreted by the model, not by the adapter. Use `chainlink-loop` for unattended work; the tool path remains for calling the loop from inside a session.
+
+What the tool path does enforce:
+
+- Task ids are normalised, so `#67`, `67` and `issue 67` are the same task.
+- **Exactly one call per turn.** A second `run_chainlink_outer` in the same turn is refused without starting a workflow.
+- On any failure the result carries `orchestrator_instruction: "Do not continue the task yourself…"`, because small models tend to do the task in the command turn after a tool failure.
+- A task that exhausts its attempts is left open and the loop moves on. Because `issue next` keeps returning that same still-open task, the loop falls back to `issue ready --json`. Pass `exclude_task_ids` for subtrees the project deliberately holds back.
+- A workflow owned by a live process is never marked `interrupted` by another instance, and if a stale `interrupted` flag appears anyway the owner reclaims it and still reaches review instead of discarding finished work.
+
+Child sessions in this path have no interactive client, so their permission requests are answered by the plugin through the `permission.evaluate` hook:
+
+- `chainlink_child_permissions: "allow"` (default, `inherit` is a synonym) — answer inline.
+- `"deny"` — refuse everything.
+- `"ask"` — legacy blocking behaviour, for debugging only.
+
+A stalled child is interrupted and re-prompted once. If the stall was caused by an unanswered permission request, the error names it (`waiting on permission external_directory …`) and the retry prompt tells the model not to repeat the same call.
+
+To load this local build instead of the npm package, update the global `~/.config/opencode/opencode.json` (applies to every project):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "file:///home/goya/.config/opencode/plugins/opencode-loop-plugin"
+    }
+  ]
+}
+```
+
+Then run `opencode reload` or restart the service. The package must contain `package.json`, `dist/server.js`, and `src/tui.tsx`.
+
+> **Long-lived servers and workflow state.** Ownership is tracked by pid, and a running workflow is only reclaimed when its owning process is gone. A server that has been running since *before* an upgrade still holds the old code in memory and will keep reclaiming workflows it can see. Give unattended runs their own state file to isolate them:
+>
+> ```bash
+> OPENCODE_LOOP_STATE_PATH=~/.local/share/opencode-loop-plugin/loops-standalone.json \
+> chainlink-loop --task 67
+> ```
+>
+> Restarting the shared service (`opencode serve --service`) makes it pick up the new bundle.
+
+Chainlink orchestration is intentionally V2-only because it uses child session creation, waiting, context collection, and interruption APIs. Ordinary `/loop` behavior and the V1 entrypoint are unchanged.
+
 Manage loops:
 
 ```text
@@ -168,7 +257,23 @@ In OpenCode 2, use the plugin object form:
         "dynamic_max_delay_seconds": 86400,
         "restricted_agents": ["plan"],
         "register_command": true,
-        "command_name": "loop"
+        "command_name": "loop",
+        "chainlink_command_name": "chainlink",
+        "chainlink_next_args": ["issue", "next", "--json"],
+        "chainlink_show_args": ["issue", "show", "--json"],
+        "chainlink_close_args": ["issue", "close", "--json"],
+        "chainlink_max_attempts": 20,
+        "chainlink_max_tasks": null,
+        "chainlink_worker_agent": "build",
+        "chainlink_reviewer_agent": "plan",
+        "chainlink_worker_timeout_seconds": 3600,
+        "chainlink_reviewer_timeout_seconds": 1800,
+        "chainlink_stall_timeout_seconds": 300,
+        "chainlink_child_permissions": "allow",
+        "chainlink_close_completed_tasks": true,
+        "chainlink_db_path": "/mnt/sharedOs/handstand-workspace/.chainlink",
+        "chainlink_worker_model": "opencode-go/space-bunny-free",
+        "chainlink_reviewer_model": "opencode/space-bunny-free"
       }
     }
   ]
@@ -186,24 +291,42 @@ Defaults:
 - `restricted_agents`: `["plan"]`; iterations are deferred while the session's last prompt came from one of these agents.
 - `register_command`: `true`
 - `command_name`: `"loop"`
+- `chainlink_command_name`: `"chainlink"`
+- `chainlink_next_args`: `["issue", "next", "--json"]`; the legacy `chainlink_ready_args` option is still accepted as an alias.
+- `chainlink_show_args`: `["issue", "show", "--json"]`
+- `chainlink_close_args`: `["issue", "close", "--json"]`
+- `chainlink_max_attempts`: `20` worker/reviewer attempts per task.
+- `chainlink_max_tasks`: `null`; an optional outer-loop task cap.
+- `chainlink_worker_agent`: `"build"`
+- `chainlink_reviewer_agent`: `"plan"`
+- `chainlink_worker_timeout_seconds`: `3600`
+- `chainlink_reviewer_timeout_seconds`: `1800`
+- `chainlink_stall_timeout_seconds`: `300`; a child that produces no session activity (message parts, tool updates) for this long is interrupted and the worker is re-prompted once. Raise it if a single tool call legitimately runs longer.
+- `chainlink_child_permissions`: `allow`; how the plugin answers permission requests from its own child sessions. `allow`/`inherit` answer inline, `deny` refuses, `ask` leaves them pending (the old blocking behaviour, for debugging only). A child session has no client attached, so anything left pending is indistinguishable from a hang.
+- `chainlink_close_completed_tasks`: `true`; approved tasks are closed by the plugin, never by the worker. `--no-close` overrides this per run.
+- `chainlink_db_path`: optional Chainlink database path; when unset, `CHAINLINK_DB` is inherited from the environment.
+- `chainlink_worker_model`: optional `provider/model` reference for worker child sessions.
+- `chainlink_reviewer_model`: optional `provider/model` reference for reviewer child sessions.
 
 ## State
 
-Loop state is stored at:
+Loop and Chainlink workflow state is stored at:
 
 ```text
-$XDG_DATA_HOME/opencode-loop-plugin/loops.json
+$XDG_DATA_HOME/opencode-loop-plugin/loops-v2.json
 ```
 
 If `XDG_DATA_HOME` is not set, the default is:
 
 ```text
-~/.local/share/opencode-loop-plugin/loops.json
+~/.local/share/opencode-loop-plugin/loops-v2.json
 ```
+
+The versioned filename isolates this plugin from older loop-plugin processes that use `loops.json` and do not understand Chainlink workflows.
 
 Set `OPENCODE_LOOP_STATE_PATH` to use a custom file.
 
-The state file is written atomically with owner-only permissions when the host filesystem supports it. Active interval loops are rehydrated and rescheduled when OpenCode restarts. Dynamic loops that were waiting on the agent to schedule their next run cannot recover on their own after a restart and are stopped with an explanatory reason.
+The state file is written atomically with owner-only permissions when the host filesystem supports it. Active interval loops are rehydrated and rescheduled when OpenCode restarts. Dynamic loops that were waiting on the agent to schedule their next run cannot recover on their own after a restart and are stopped with an explanatory reason. Chainlink workflows are marked `interrupted` on restart rather than blindly repeating worker actions.
 
 ## Credits
 

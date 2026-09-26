@@ -1,0 +1,8 @@
+#!/usr/bin/env bun
+// Entry point for the `chainlink-loop` command: a deterministic Chainlink
+// outer/inner loop with no LLM in the control path.
+// Loads the bundled CLI so the command works from a checkout and from an
+// installed package alike (`bun run build` regenerates dist/chainlink-loop.js).
+import { main } from "../dist/chainlink-loop.js"
+
+process.exit(await main(process.argv.slice(2)))
