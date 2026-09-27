@@ -498,7 +498,7 @@ When finished, summarize the changes and checks.`;
 function reviewerPrompt(workflow, task, attempt, workerOutput) {
   return `You are the reviewer agent for Chainlink task ${task.id}, workflow ${workflow.id}, attempt ${attempt}/${workflow.maxAttempts}.
 You are running unattended. Never ask questions; if review cannot be completed, return a blocking finding explaining why.
-Review the current repository state and worker report for correctness, scope, tests, regressions, and task completion. Do not edit files.
+Review the current repository state and worker report for correctness, scope, tests, regressions, and task completion. Check the task requirements and repository conventions for how the work should be delivered. If this task calls for a commit, verify that its deliverables are committed before approving; report uncommitted task deliverables as a blocking finding. Do not require a commit for tasks that do not call for one, and do not block on unrelated pre-existing changes. Do not edit files.
 
 Return only strict JSON with this shape:
 {"approved":true|false,"summary":"short result","findings":["blocking finding"],"next_action":"concrete next step"}
