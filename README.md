@@ -119,6 +119,9 @@ chainlink-loop --task 67
 chainlink-loop --task 12,71 --no-close
 chainlink-loop --attempts 5 --max-tasks 3
 
+# steer every task with a direction on top of the issue notes
+chainlink-loop --prompt "reuse the existing storage layer; add no new dependencies"
+
 # from a checkout, without installing the bin
 bun run src/chainlink-cli.ts --task 67 --dry-run
 ```
@@ -131,6 +134,7 @@ bun run src/chainlink-cli.ts --task 67 --dry-run
 | `--no-close` | Leave approved issues open. Default is to close them. |
 | `--review-first auto\|always\|never` | Review work that already exists before dispatching a fresh worker (default `auto`). |
 | `--exclude <ids>` | Skip these issue subtrees when selecting ready tasks after an exhausted issue. |
+| `--prompt <text>` | Operator direction layered above each task's notes. Both the worker and the reviewer follow it, so a run can be scoped without editing the issues. Also settable via `CHAINLINK_PROMPT`; `--prompt` wins. |
 | `--worker-model` / `--reviewer-model` | `provider/model` per role. |
 | `--worker-agent` / `--reviewer-agent` | Defaults: `build` and `plan`. |
 | `--worker-timeout` / `--reviewer-timeout` | Per-step wall clock limit in seconds. |
@@ -159,6 +163,7 @@ The V2 plugin also registers a `/chainlink` command and a `run_chainlink_outer` 
 What the tool path does enforce:
 
 - Task ids are normalised, so `#67`, `67` and `issue 67` are the same task.
+- A `custom_prompt` (set from `/chainlink --prompt "..."`) is layered above every task's notes. The worker follows it alongside the requirements and the reviewer holds the work to it, so you can scope a run without editing the issues.
 - **Exactly one call per turn.** A second `run_chainlink_outer` in the same turn is refused without starting a workflow.
 - On any failure the result carries `orchestrator_instruction: "Do not continue the task yourself…"`, because small models tend to do the task in the command turn after a tool failure.
 - A task that exhausts its attempts is left open and the loop moves on. Because `issue next` keeps returning that same still-open task, the loop falls back to `issue ready --json`. Pass `exclude_task_ids` for subtrees the project deliberately holds back.

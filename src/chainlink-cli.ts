@@ -32,6 +32,7 @@ function parseJSON(text: string): unknown {
  *   bun run src/chainlink-cli.ts                      # drain the queue
  *   bun run src/chainlink-cli.ts --task 67 --no-close # one issue, leave it open
  *   bun run src/chainlink-cli.ts --task 67,71 --attempts 5
+ *   bun run src/chainlink-cli.ts --prompt "keep changes minimal"
  */
 type Parsed = {
   taskIds: string[] | null
@@ -46,6 +47,7 @@ type Parsed = {
   reviewerAgent: string
   workerTimeout: number
   reviewerTimeout: number
+  customPrompt: string | null
   dryRun: boolean
   version: boolean
   help: boolean
@@ -73,12 +75,16 @@ Options:
   --reviewer-agent <a> Agent for the reviewer (default plan; plan cannot edit files).
   --worker-timeout <s>   Per-step worker timeout in seconds (default 3600).
   --reviewer-timeout <s> Per-step reviewer timeout in seconds (default 1800).
+  --prompt <text>     Operator direction layered above each task's notes; both
+                      the worker and the reviewer follow it. Quote multi-word
+                      values, e.g. --prompt "prefer the existing parser".
   --dry-run           Print the plan and exit without running anything.
   -v, --version       Show the plugin build version and exit.
   -h, --help          Show this help.
 
 Environment:
   CHAINLINK_DB        Chainlink database path (passed through to the CLI).
+  CHAINLINK_PROMPT    Operator direction; overridden by --prompt.
 `
 
 function parseArgs(argv: string[]): Parsed {
@@ -98,6 +104,7 @@ function parseArgs(argv: string[]): Parsed {
     reviewerAgent: process.env.CHAINLINK_REVIEWER_AGENT ?? "plan",
     workerTimeout: Number(process.env.CHAINLINK_WORKER_TIMEOUT ?? 3600),
     reviewerTimeout: Number(process.env.CHAINLINK_REVIEWER_TIMEOUT ?? 1800),
+    customPrompt: process.env.CHAINLINK_PROMPT ?? null,
     dryRun: false,
     version: false,
     help: false,
@@ -167,6 +174,9 @@ function parseArgs(argv: string[]): Parsed {
       case "--reviewer-timeout":
         parsed.reviewerTimeout = Number(next())
         break
+      case "--prompt":
+        parsed.customPrompt = next()
+        break
       case "--dry-run":
         parsed.dryRun = true
         break
@@ -230,6 +240,7 @@ export async function main(argv: string[]) {
     closeOnApproval: parsed.closeOnApproval,
     reviewFirst: parsed.reviewFirst,
     excludeIDs: parsed.excludeIDs,
+    customPrompt: parsed.customPrompt,
     runner: execChainlinkCommand,
     step,
     selectionArgs: ["issue", "next", "--json"],
@@ -244,6 +255,7 @@ export async function main(argv: string[]) {
     log(`tasks: ${parsed.taskIds?.join(", ") ?? "(queue)"}`)
     log(`attempts: ${parsed.attempts}, close on approval: ${parsed.closeOnApproval}, review-first: ${parsed.reviewFirst}`)
     if (parsed.excludeIDs.length) log(`excluded subtrees: ${parsed.excludeIDs.join(", ")}`)
+    if (parsed.customPrompt) log(`direction: ${parsed.customPrompt}`)
     if (parsed.taskIds?.length === 1) {
       const show = await execChainlinkCommand(["issue", "show", "--json", parsed.taskIds[0]!.replace(/^#/, "")], cwd, options.dbPath)
       const task = parseJSON(show.stdout) as Record<string, unknown>

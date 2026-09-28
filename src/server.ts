@@ -973,6 +973,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             type: "string",
             description: "Optional reviewer model reference in provider/model form.",
           },
+          custom_prompt: {
+            type: "string",
+            maxLength: 4000,
+            description:
+              "Optional operator direction layered above each Chainlink task's notes. Both the worker and the reviewer follow it, so a run can be scoped without editing the issues.",
+          },
         }),
         options: { codemode: false },
         execute: async (args, toolContext) => {
@@ -984,6 +990,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             close_on_approval?: boolean
             worker_model?: string
             reviewer_model?: string
+            custom_prompt?: string
           }
           observedSessions.add(toolContext.sessionID)
           // The contract is "call this exactly once per turn". A model that
@@ -1021,6 +1028,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             ),
             closeOnApproval: input.close_on_approval ?? chainlinkCloseCompletedTasks,
             excludeTaskIDs: input.exclude_task_ids ?? [],
+            customPrompt: input.custom_prompt?.trim() || null,
             workerModel: parseModelRef(input.worker_model ?? chainlinkWorkerModel),
             reviewerModel: parseModelRef(input.reviewer_model ?? chainlinkReviewerModel),
             dbPath: chainlinkDbPath,

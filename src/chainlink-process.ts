@@ -197,6 +197,12 @@ export type ProcessLoopOptions = {
    * project deliberately holds back need naming explicitly.
    */
   excludeIDs?: readonly string[]
+  /**
+   * Operator-supplied direction for the whole run, layered above each task's
+   * notes. It steers how the tasks are done (or reviewed) without editing the
+   * issues themselves.
+   */
+  customPrompt?: string | null
   runner: ChainlinkCommandRunner
   step: ProcessRunner
   selectionArgs: string[]
@@ -277,7 +283,7 @@ export async function runProcessInnerLoop(
   const runReviewer = async (attempt: number): Promise<ChainlinkReview> => {
     const result = await options.step({
       cwd: options.cwd,
-      prompt: reviewerPrompt(promptContext, task, attempt, workerOutput),
+      prompt: reviewerPrompt(promptContext, task, attempt, workerOutput, options.customPrompt),
       timeoutSeconds: options.reviewerTimeoutSeconds,
       agent: options.reviewerAgent,
       model: options.reviewerModel,
@@ -317,7 +323,7 @@ export async function runProcessInnerLoop(
     const first = attempt === 1 && !existingWork && !pendingReview
     // After the first rejection the next worker turn carries the review
     // findings, so the same session keeps its context instead of restarting.
-    const prompt = pendingReview ? feedbackPrompt(promptContext, pendingReview) : workerPrompt(promptContext, task, attempt)
+    const prompt = pendingReview ? feedbackPrompt(promptContext, pendingReview, options.customPrompt) : workerPrompt(promptContext, task, attempt, undefined, options.customPrompt)
     log(`task ${task.id} attempt ${attempt}/${workflow.maxAttempts}: worker ${first ? "start" : "resume"}`)
     const worker = await options.step({
       cwd: options.cwd,
