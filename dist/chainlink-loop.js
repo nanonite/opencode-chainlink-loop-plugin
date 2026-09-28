@@ -976,6 +976,30 @@ async function acquireLoopLock(cwd, dbPath, pid = process.pid, isProcessAlive = 
   throw new Error(`could not acquire the Chainlink loop lock at ${path}`);
 }
 
+// src/version.ts
+var PLUGIN_NAME = "@prevalentware/opencode-loop-plugin";
+function readString(value) {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+var injectedVersion = readString("0.2.0");
+var BUILD_INFO = {
+  name: PLUGIN_NAME,
+  version: injectedVersion ?? "0.0.0-dev",
+  gitDescribe: readString("v0.1.8-5-gb34d018"),
+  gitSha: readString("b34d018"),
+  gitDirty: false,
+  source: injectedVersion ? "build" : "dev"
+};
+function formatBuildInfo(info = BUILD_INFO) {
+  const parts = [info.version];
+  const revision = info.gitDescribe ?? info.gitSha;
+  if (revision)
+    parts.push(`(${revision}${info.gitDirty ? ", dirty" : ""})`);
+  else if (info.source === "dev")
+    parts.push("(dev)");
+  return parts.join(" ");
+}
+
 // src/chainlink-cli.ts
 function parseJSON2(text) {
   try {
@@ -1007,6 +1031,7 @@ Options:
   --worker-timeout <s>   Per-step worker timeout in seconds (default 3600).
   --reviewer-timeout <s> Per-step reviewer timeout in seconds (default 1800).
   --dry-run           Print the plan and exit without running anything.
+  -v, --version       Show the plugin build version and exit.
   -h, --help          Show this help.
 
 Environment:
@@ -1027,6 +1052,7 @@ function parseArgs(argv) {
     workerTimeout: Number(process.env.CHAINLINK_WORKER_TIMEOUT ?? 3600),
     reviewerTimeout: Number(process.env.CHAINLINK_REVIEWER_TIMEOUT ?? 1800),
     dryRun: false,
+    version: false,
     help: false
   };
   for (let i = 0;i < argv.length; i += 1) {
@@ -1042,6 +1068,10 @@ function parseArgs(argv) {
       case "-h":
       case "--help":
         parsed.help = true;
+        break;
+      case "-v":
+      case "--version":
+        parsed.version = true;
         break;
       case "--task":
       case "--tasks":
@@ -1116,6 +1146,11 @@ ${USAGE}`);
     process.stdout.write(USAGE);
     return 0;
   }
+  if (parsed.version) {
+    process.stdout.write(`${PLUGIN_NAME} ${formatBuildInfo()}
+`);
+    return 0;
+  }
   const cwd = process.cwd();
   const ownerSessionID = `chainlink-cli-${process.pid}`;
   const log = (line) => process.stdout.write(`[chainlink] ${line}
@@ -1151,6 +1186,7 @@ ${USAGE}`);
     dbPath: process.env.CHAINLINK_DB ?? null
   };
   if (parsed.dryRun) {
+    log(`build: ${formatBuildInfo()}`);
     log(`cwd: ${cwd}`);
     log(`tasks: ${parsed.taskIds?.join(", ") ?? "(queue)"}`);
     log(`attempts: ${parsed.attempts}, close on approval: ${parsed.closeOnApproval}, review-first: ${parsed.reviewFirst}`);

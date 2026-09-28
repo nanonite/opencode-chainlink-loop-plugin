@@ -1089,7 +1089,7 @@ When finished, summarize the changes and checks.`;
 function reviewerPrompt(workflow, task, attempt, workerOutput) {
   return `You are the reviewer agent for Chainlink task ${task.id}, workflow ${workflow.id}, attempt ${attempt}/${workflow.maxAttempts}.
 You are running unattended. Never ask questions; if review cannot be completed, return a blocking finding explaining why.
-Review the current repository state and worker report for correctness, scope, tests, regressions, and task completion. Do not edit files.
+Review the current repository state and worker report for correctness, scope, tests, regressions, and task completion. Check the task requirements and repository conventions for how the work should be delivered. If this task calls for a commit, verify that its deliverables are committed before approving; report uncommitted task deliverables as a blocking finding. Do not require a commit for tasks that do not call for one, and do not block on unrelated pre-existing changes. Do not edit files.
 
 Return only strict JSON with this shape:
 {"approved":true|false,"summary":"short result","findings":["blocking finding"],"next_action":"concrete next step"}
@@ -1476,6 +1476,30 @@ ${formatLoops(open)}
 Preserve each loop's id, cadence, instruction, and status in the compacted context. The scheduler will keep re-injecting active loops after compaction; the agent can manage them with list_loops, stop_loop, pause_loop, resume_loop, run_loop, and schedule_next_run.`;
 }
 
+// src/version.ts
+var PLUGIN_NAME = "@prevalentware/opencode-loop-plugin";
+function readString(value) {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+var injectedVersion = readString("0.2.0");
+var BUILD_INFO = {
+  name: PLUGIN_NAME,
+  version: injectedVersion ?? "0.0.0-dev",
+  gitDescribe: readString("v0.1.8-5-gb34d018"),
+  gitSha: readString("b34d018"),
+  gitDirty: false,
+  source: injectedVersion ? "build" : "dev"
+};
+function formatBuildInfo(info = BUILD_INFO) {
+  const parts = [info.version];
+  const revision = info.gitDescribe ?? info.gitSha;
+  if (revision)
+    parts.push(`(${revision}${info.gitDirty ? ", dirty" : ""})`);
+  else if (info.source === "dev")
+    parts.push("(dev)");
+  return parts.join(" ");
+}
+
 // src/server.ts
 var DEFAULT_COMMAND_NAME = "loop";
 var DEFAULT_BUSY_BACKOFF_SECONDS = 60;
@@ -1559,7 +1583,7 @@ function isBusyEvent(event) {
 }
 async function toolResult(sessionID, extra = {}) {
   const loops = await listLoops(sessionID);
-  return JSON.stringify({ ...extra, loops, report: formatLoops(loops) }, null, 2);
+  return JSON.stringify({ ...extra, plugin: BUILD_INFO, loops, report: formatLoops(loops) }, null, 2);
 }
 var server = async ({ client }, options) => {
   const registerCommand = options?.register_command ?? true;
@@ -1583,6 +1607,7 @@ var server = async ({ client }, options) => {
       return;
     });
   }
+  await log("info", `opencode-loop-plugin ${formatBuildInfo()} loaded`);
   function cancelTimer(loopID) {
     const timer = timers.get(loopID);
     if (timer)
@@ -1984,6 +2009,7 @@ async function setupV2(context) {
   const registrations = [];
   const chainlinkRegistries = new Set;
   const chainlinkInvocations = new Map;
+  v2Log("info", `opencode-loop-plugin ${formatBuildInfo()} loaded`, { ...BUILD_INFO });
   const isRestrictedAgent = (agent) => typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase());
   async function isSessionBusy(sessionID) {
     const session = context.session;
@@ -2346,6 +2372,7 @@ Call run_chainlink_outer exactly once with exactly this JSON input.`,
           content: JSON.stringify({
             ...result,
             ...result.status === "failed" || result.status === "exhausted" ? { orchestrator_instruction: "Do not continue the task yourself. Report this result and end the turn." } : {},
+            plugin: BUILD_INFO,
             loops: await listLoops(toolContext.sessionID)
           }, null, 2)
         };
