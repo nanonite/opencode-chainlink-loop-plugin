@@ -49,7 +49,7 @@ function toolMessage(id: string, loops: Loop[]): SessionMessageInfo {
   } as SessionMessageInfo
 }
 
-type Layer = { commands?: readonly { id?: string; title?: string; palette?: true; run: () => void }[] }
+type Layer = { commands?: readonly { id?: string; title?: string; palette?: true; bind?: string; run: () => void }[] }
 
 function mockContext() {
   const slots = new Map<string, (props: { sessionID: string }) => unknown>()
@@ -187,6 +187,7 @@ test("V2 app slot registers the loop palette command", async () => {
     const command = mock.layers[0]?.().commands?.find((candidate) => candidate.id === "loop.show")
     expect(command?.title).toBe("Loops")
     expect(command?.palette).toBe(true)
+    expect(command?.bind).toBe("ctrl+l")
   } finally {
     rendered.renderer.destroy()
     cleanup()

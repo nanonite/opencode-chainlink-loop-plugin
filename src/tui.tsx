@@ -476,6 +476,7 @@ function LoopKeymapLayerV2(api: TuiPluginV2.Context) {
         title: "Loops",
         description: "View, run, pause, resume, or stop the recurring loops in this session",
         group: "Loop",
+        bind: "ctrl+l",
         palette: true,
         run: () => {
           const sessionID = currentSessionIDV2(api)

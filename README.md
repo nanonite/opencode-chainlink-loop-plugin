@@ -15,7 +15,7 @@ The OpenCode Loop Plugin adds:
 - Dynamic loops where the agent itself picks the delay before each next iteration via `schedule_next_run`, mirroring Claude Code's self-paced `/loop`.
 - Agent tools: `create_loop`, `list_loops`, `stop_loop`, `pause_loop`, `resume_loop`, `run_loop`, `schedule_next_run`, and `clear_loops`.
 - Persistent loop state that survives OpenCode restarts, with atomic writes and owner-only file permissions.
-- A TUI sidebar with live countdowns and a `Loops` command-palette entry to run, pause, resume, or stop loops.
+- A TUI sidebar with live countdowns and a `Loops` command (`Ctrl+L`) to run, pause, resume, or stop loops.
 - Plan-mode safety: iterations are deferred while the session's last prompt came from a restricted agent (default: `plan`).
 - Compaction context so active loops are preserved when OpenCode summarizes a long session.
 - Safety rails: minimum interval, per-session loop limit, optional max runs, and automatic expiry after 7 days.
@@ -84,7 +84,9 @@ This plugin supports OpenCode 2 preview `0.0.0-next-17055` while remaining compa
 }
 ```
 
-OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint is loaded from `opencode.json`; the sidebar and palette integration are loaded from the global `~/.config/opencode/cli.json`.
+OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint is loaded from `opencode.json`; the sidebar and the `Loops` command are loaded from the global `~/.config/opencode/cli.json`.
+
+The sidebar renders the focused session's active loops. Press `Ctrl+L` to open the loop actions (refresh, run, pause, resume, stop); selecting one sends the matching loop tool call to the agent. OpenCode 2.0.16 does not surface plugin commands in the `Ctrl+P` command palette, so `Ctrl+L` is the entrypoint there.
 
 The OpenCode 2 plugin API is still in preview. This release targets the exact preview above; later previews may require a plugin update. V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, and TUI sidebar/palette integration. The dedicated V1 compaction-context hook has no V2 equivalent in this preview. V2 still injects the active-loop system reminder before model dispatch, but cannot append the separate loop block directly to a compaction operation.
 
@@ -200,7 +202,7 @@ The sidebar and command palette render in the terminal client, which takes its p
 }
 ```
 
-The CLI then reads `tui.tsx` from the directory and registers the sidebar and the `Loops` palette command.
+The CLI then reads `tui.tsx` from the directory and registers the sidebar and the `Loops` command (`Ctrl+L`).
 
 Git specifiers fail on OpenCode 2.0.16 for packages that declare build, prepare, or install scripts (upstream opencode issues 49704 and 46551). Until those fixes ship, load the checkout directory or use the npm package.
 
