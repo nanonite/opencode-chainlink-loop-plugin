@@ -177,20 +177,20 @@ Child sessions in this path have no interactive client, so their permission requ
 
 A stalled child is interrupted and re-prompted once. If the stall was caused by an unanswered permission request, the error names it (`waiting on permission external_directory …`) and the retry prompt tells the model not to repeat the same call.
 
-To load this local build instead of the npm package, update the global `~/.config/opencode/opencode.json` (applies to every project):
+To load this local checkout instead of the npm package, add the checkout to the global `~/.config/opencode/opencode.json` (applies to every project):
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    {
-      "package": "file:///home/goya/.config/opencode/plugins/opencode-loop-plugin"
-    }
+    "file:///path/to/opencode-chainlink-loop-plugin"
   ]
 }
 ```
 
-Then run `opencode reload` or restart the service. The package must contain `package.json`, `dist/server.js`, and `src/tui.tsx`.
+Run `bun install` and `bun run build` first. OpenCode 2 loads a configured plugin directory through an `index.js` or `index.ts` entrypoint, and this repository ships `index.js` for that purpose. Point the entry at the directory: OpenCode 2 rejects configured file paths with `configured plugin path must be a directory`. Then run `opencode reload` or restart the service.
+
+Git specifiers fail on OpenCode 2.0.16 for packages that declare build, prepare, or install scripts (upstream opencode issues 49704 and 46551). Until those fixes ship, load the checkout directory or use the npm package.
 
 > **Long-lived servers and workflow state.** Ownership is tracked by pid, and a running workflow is only reclaimed when its owning process is gone. A server that has been running since *before* an upgrade still holds the old code in memory and will keep reclaiming workflows it can see. Give unattended runs their own state file to isolate them:
 >
@@ -360,6 +360,8 @@ An unbundled run (`bun test`, `bun run src/chainlink-cli.ts`) reports `0.0.0-dev
 
 `bun run build` stamps both bundles; `bun run build:server` and `bun run build:cli` build one at a time.
 
+`dist/` is committed so a checkout can load without a build step. `bun run check:dist` rebuilds with the identity recorded in `dist/build-info.json` and fails when `dist/` does not match the source; CI runs this check on every pull request. Run `bun run build` after a source change and commit `dist/` together with it.
+
 ## Credits
 
 This plugin follows the semantics of Claude Code's `/loop` skill (interval parsing, immediate first iteration, dynamic self-pacing with an explicit schedule-or-stop contract, and 7-day auto-expiry) implemented on top of OpenCode plugin hooks. The package structure, persistence approach, and idle-continuation mechanics follow [`@prevalentware/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin).
@@ -372,6 +374,7 @@ bun test
 bun run lint
 bun run typecheck
 bun run build
+bun run check:dist
 npm pack --dry-run
 ```
 

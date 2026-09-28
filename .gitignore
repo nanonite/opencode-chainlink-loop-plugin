@@ -1,5 +1,4 @@
 .data/
-dist/
 node_modules/
 plans
 claude.md

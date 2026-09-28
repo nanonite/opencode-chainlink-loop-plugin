@@ -26,6 +26,7 @@ This package is an OpenCode plugin with separate server and TUI entrypoints:
 - State writes should remain atomic: write to a temp file, then `rename` into place.
 - Use `OPENCODE_LOOP_STATE_PATH` for tests and smoke runs so you do not touch a real user's loop state.
 - All loop tools return `{ ..., loops }` for the session; the TUI sidebar parses that shape from tool outputs, so keep it stable.
+- Keep the repository-root `index.js` entrypoint and the committed `dist/` output in sync; OpenCode 2 loads this checkout directory through that entrypoint.
 
 ## Local Validation
 
@@ -36,10 +37,11 @@ bun run lint
 bun run typecheck
 bun test
 bun run build
+bun run check:dist
 bun run pack:dry-run
 ```
 
-`bun run build` writes `dist/server.js`. The package only publishes `dist`, `src/tui.tsx`, `LICENSE`, and `README.md`, so confirm `npm pack --dry-run` includes what runtime installation needs.
+`bun run build` writes `dist/server.js`. `dist/` is committed; `bun run check:dist` rebuilds with the identity recorded in `dist/build-info.json` and fails when `dist/` does not match the source. The package only publishes `dist`, `src/tui.tsx`, `LICENSE`, and `README.md`, so confirm `npm pack --dry-run` includes what runtime installation needs.
 
 ## Publishing Flow
 
@@ -54,10 +56,16 @@ gh release view v<version>
 
 ## End-To-End Plugin Test
 
-To test this plugin end to end, do not stop at unit tests. Run the local gates first, then install the published version in an isolated temp OpenCode project with `opencode plugin @prevalentware/opencode-loop-plugin@<version>`, run `opencode debug config` to confirm the package is loaded and the `loop` command is registered, then run a smoke test with an isolated state file, for example:
+To test this plugin end to end, do not stop at unit tests. Run the local gates first, then load the checkout in an isolated OpenCode 2 project:
+
+1. Point a temp config at the checkout directory: `"plugins": ["file:///path/to/opencode-chainlink-loop-plugin"]`.
+2. Run `opencode run --standalone --print-logs --log-level info` and confirm a `msg="loading plugin"` line for the directory.
+3. Run a smoke test with an isolated state file:
 
 ```bash
-OPENCODE_LOOP_STATE_PATH="/tmp/opencode-loop-plugin-smoke/loops.json" opencode run "/loop 1m say exactly 'tick' and stop this loop after confirming it exists"
+OPENCODE_LOOP_STATE_PATH="/tmp/opencode-loop-plugin-smoke/loops.json" opencode run --standalone "/loop 1m say exactly 'tick' and stop this loop after confirming it exists"
 ```
 
 The smoke test should show `create_loop` (and possibly `stop_loop`) tool calls. Inspect the state file afterward to confirm JSON persistence, and clean up with `/loop stop <id>` or by deleting the smoke state file.
+
+OpenCode 2 loads a configured plugin directory through an `index.js` or `index.ts` entrypoint, so keep the repository-root `index.js` in place. Configured file paths are rejected and Git specifiers for packages with build scripts fail on OpenCode 2.0.16 (upstream opencode issues 49704 and 46551).

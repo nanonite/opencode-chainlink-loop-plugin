@@ -51,6 +51,7 @@
     "build": "bun run clean && bun scripts/build.ts",
     "build:server": "bun scripts/build.ts server",
     "build:cli": "bun scripts/build.ts cli",
+    "check:dist": "bun scripts/check-dist.ts",
     "ci:version": "bun scripts/resolve-ci-version.ts",
     "lint": "eslint .",
     "pack:dry-run": "npm pack --dry-run",

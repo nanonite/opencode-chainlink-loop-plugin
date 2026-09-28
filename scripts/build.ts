@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process"
-import { readFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
 // Builds the plugin bundles and stamps each one with its identity.
@@ -11,6 +11,11 @@ import { fileURLToPath } from "node:url"
 // The identity values are injected with `bun build --define` and read back in
 // src/version.ts. They let a running plugin report which source it came from:
 // package version, `git describe`, short sha, and whether the tree was dirty.
+//
+// `dist/build-info.json` records the same identity. `scripts/check-dist.ts`
+// rebuilds with PLUGIN_BUILD_VERSION, PLUGIN_BUILD_DESCRIBE, PLUGIN_BUILD_SHA,
+// and PLUGIN_BUILD_DIRTY pinned to the recorded values, so a committed dist/
+// can be verified without depending on the checked-out git state.
 //
 // `git describe` is the human-facing field: it names the most recent release tag
 // plus the commits since it (e.g. `v0.1.8-4-g64bff2f`), so a local build is
@@ -57,15 +62,26 @@ function isDirty(): boolean {
   }
 }
 
+/**
+ * Build identity overrides for reproducible checks. An empty value pins the
+ * field to null; an unset variable lets the build detect the value from git.
+ */
+function stringOverride(name: string): string | null | undefined {
+  const value = process.env[name]
+  if (value === undefined) return undefined
+  return value.length > 0 ? value : null
+}
+
 const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
   version?: unknown
 }
 const version = typeof pkg.version === "string" && pkg.version.length > 0 ? pkg.version : "0.0.0"
+const dirtyOverride = stringOverride("PLUGIN_BUILD_DIRTY")
 const buildInfo = {
-  version,
-  gitDescribe: git(["describe", "--tags", "--always"]),
-  gitSha: git(["rev-parse", "--short", "HEAD"]),
-  gitDirty: isDirty(),
+  version: stringOverride("PLUGIN_BUILD_VERSION") ?? version,
+  gitDescribe: stringOverride("PLUGIN_BUILD_DESCRIBE") ?? git(["describe", "--tags", "--always"]),
+  gitSha: stringOverride("PLUGIN_BUILD_SHA") ?? git(["rev-parse", "--short", "HEAD"]),
+  gitDirty: dirtyOverride === undefined ? isDirty() : dirtyOverride === "true",
 }
 
 // `bun build --define` takes space-separated KEY=VALUE pairs (the colon form is
@@ -105,6 +121,12 @@ if (requested !== "all" && requested !== "server" && requested !== "cli") {
 }
 if (requested === "all" || requested === "server") build("server")
 if (requested === "all" || requested === "cli") build("cli")
+
+mkdirSync(fileURLToPath(new URL("../dist", import.meta.url)), { recursive: true })
+writeFileSync(
+  new URL("../dist/build-info.json", import.meta.url),
+  `${JSON.stringify(buildInfo, null, 2)}\n`,
+)
 
 console.log(
   `[build] ${buildInfo.version} ${buildInfo.gitDescribe ?? buildInfo.gitSha ?? "unknown"}${
