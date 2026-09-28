@@ -38,6 +38,7 @@ import {
   loopCommandTemplate,
   systemReminder,
 } from "./prompts"
+import { BUILD_INFO, formatBuildInfo } from "./version"
 
 type Options = {
   register_command?: boolean
@@ -159,7 +160,7 @@ function isBusyEvent(event: { type?: string; properties?: Record<string, unknown
 
 async function toolResult(sessionID: string, extra: Record<string, unknown> = {}) {
   const loops = await listLoops(sessionID)
-  return JSON.stringify({ ...extra, loops, report: formatLoops(loops) }, null, 2)
+  return JSON.stringify({ ...extra, plugin: BUILD_INFO, loops, report: formatLoops(loops) }, null, 2)
 }
 
 const server: Plugin = async ({ client }, options?: Options) => {
@@ -193,6 +194,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
       ?.log?.({ body: { service: "opencode-loop-plugin", level, message, extra } })
       .catch(() => undefined)
   }
+
+  await log("info", `opencode-loop-plugin ${formatBuildInfo()} loaded`)
 
   function cancelTimer(loopID: string) {
     const timer = timers.get(loopID)
@@ -647,6 +650,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   // sessionID -> messageID of the turn that already invoked the outer loop.
   const chainlinkInvocations = new Map<string, string>()
 
+  v2Log("info", `opencode-loop-plugin ${formatBuildInfo()} loaded`, { ...BUILD_INFO })
+
   const isRestrictedAgent = (agent: string | null | undefined) =>
     typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase())
 
@@ -1038,6 +1043,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                 ...(result.status === "failed" || result.status === "exhausted"
                   ? { orchestrator_instruction: "Do not continue the task yourself. Report this result and end the turn." }
                   : {}),
+                plugin: BUILD_INFO,
                 loops: await listLoops(toolContext.sessionID),
               },
               null,

@@ -11,6 +11,7 @@ import {
 } from "./chainlink-process"
 import { execChainlinkCommand, parseModelRef } from "./chainlink"
 import { acquireLoopLock, type LoopLock } from "./chainlink-lock"
+import { PLUGIN_NAME, formatBuildInfo } from "./version"
 
 function parseJSON(text: string): unknown {
   try {
@@ -46,6 +47,7 @@ type Parsed = {
   workerTimeout: number
   reviewerTimeout: number
   dryRun: boolean
+  version: boolean
   help: boolean
 }
 
@@ -72,6 +74,7 @@ Options:
   --worker-timeout <s>   Per-step worker timeout in seconds (default 3600).
   --reviewer-timeout <s> Per-step reviewer timeout in seconds (default 1800).
   --dry-run           Print the plan and exit without running anything.
+  -v, --version       Show the plugin build version and exit.
   -h, --help          Show this help.
 
 Environment:
@@ -96,6 +99,7 @@ function parseArgs(argv: string[]): Parsed {
     workerTimeout: Number(process.env.CHAINLINK_WORKER_TIMEOUT ?? 3600),
     reviewerTimeout: Number(process.env.CHAINLINK_REVIEWER_TIMEOUT ?? 1800),
     dryRun: false,
+    version: false,
     help: false,
   }
   for (let i = 0; i < argv.length; i += 1) {
@@ -110,6 +114,10 @@ function parseArgs(argv: string[]): Parsed {
       case "-h":
       case "--help":
         parsed.help = true
+        break
+      case "-v":
+      case "--version":
+        parsed.version = true
         break
       case "--task":
       case "--tasks":
@@ -189,6 +197,10 @@ export async function main(argv: string[]) {
     process.stdout.write(USAGE)
     return 0
   }
+  if (parsed.version) {
+    process.stdout.write(`${PLUGIN_NAME} ${formatBuildInfo()}\n`)
+    return 0
+  }
 
   const cwd = process.cwd()
   const ownerSessionID = `chainlink-cli-${process.pid}`
@@ -227,6 +239,7 @@ export async function main(argv: string[]) {
   }
 
   if (parsed.dryRun) {
+    log(`build: ${formatBuildInfo()}`)
     log(`cwd: ${cwd}`)
     log(`tasks: ${parsed.taskIds?.join(", ") ?? "(queue)"}`)
     log(`attempts: ${parsed.attempts}, close on approval: ${parsed.closeOnApproval}, review-first: ${parsed.reviewFirst}`)

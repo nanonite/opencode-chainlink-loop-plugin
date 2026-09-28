@@ -135,6 +135,7 @@ bun run src/chainlink-cli.ts --task 67 --dry-run
 | `--worker-agent` / `--reviewer-agent` | Defaults: `build` and `plan`. |
 | `--worker-timeout` / `--reviewer-timeout` | Per-step wall clock limit in seconds. |
 | `--dry-run` | Show the selected settings and, for one issue, whether existing work will be reviewed first. |
+| `-v`, `--version` | Print the plugin build version and exit. |
 
 The loop per task:
 
@@ -332,6 +333,27 @@ The versioned filename isolates this plugin from older loop-plugin processes tha
 Set `OPENCODE_LOOP_STATE_PATH` to use a custom file.
 
 The state file is written atomically with owner-only permissions when the host filesystem supports it. Active interval loops are rehydrated and rescheduled when OpenCode restarts. Dynamic loops that were waiting on the agent to schedule their next run cannot recover on their own after a restart and are stopped with an explanatory reason. Chainlink workflows are marked `interrupted` on restart rather than blindly repeating worker actions.
+
+## Versioning
+
+`package.json` holds the release version. The CI publish job computes the next version from npm and rewrites it just before `npm publish`, so a checkout can sit at an older number than the latest published release.
+
+To make a *built* artifact identify itself, `scripts/build.ts` stamps every bundle with:
+
+- `version` — the `package.json` version at build time.
+- `gitDescribe` — `git describe --tags --always`, e.g. `v0.1.8-4-g64bff2f` (the last release tag plus the commits since it).
+- `gitSha` — the abbreviated commit sha.
+- `gitDirty` — whether tracked *source* differed from `HEAD`. Generated paths are ignored: `dist/` and the `package.json` rewrite that CI performs.
+
+The stamp is injected with `bun build --define` and read back by `src/version.ts`. Where to see it:
+
+- On plugin load: `opencode-loop-plugin 0.2.0 (v0.1.8-4-g64bff2f) loaded`.
+- In every loop tool result, under the `plugin` field (the TUI ignores it; the `loops` field stays the same).
+- From the CLI: `chainlink-loop --version` prints `@prevalentware/opencode-loop-plugin 0.2.0 (v0.1.8-4-g64bff2f)`.
+
+An unbundled run (`bun test`, `bun run src/chainlink-cli.ts`) reports `0.0.0-dev (dev)`, because no build stamp is present.
+
+`bun run build` stamps both bundles; `bun run build:server` and `bun run build:cli` build one at a time.
 
 ## Credits
 

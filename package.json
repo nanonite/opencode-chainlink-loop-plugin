@@ -1,6 +1,6 @@
 {
   "name": "@prevalentware/opencode-loop-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenCode loop plugin that adds Claude Code-style /loop recurring prompts: a persistent scheduler that re-injects an instruction into a session on an interval while it is idle.",
   "keywords": [
     "opencode",
@@ -48,9 +48,9 @@
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "bun run clean && bun run build:server && bun run build:cli",
-    "build:server": "bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --external effect --external zod",
-    "build:cli": "bun build ./src/chainlink-cli.ts --outfile ./dist/chainlink-loop.js --target bun --external effect --external zod",
+    "build": "bun run clean && bun scripts/build.ts",
+    "build:server": "bun scripts/build.ts server",
+    "build:cli": "bun scripts/build.ts cli",
     "ci:version": "bun scripts/resolve-ci-version.ts",
     "lint": "eslint .",
     "pack:dry-run": "npm pack --dry-run",
