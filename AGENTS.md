@@ -26,7 +26,7 @@ This package is an OpenCode plugin with separate server and TUI entrypoints:
 - State writes should remain atomic: write to a temp file, then `rename` into place.
 - Use `OPENCODE_LOOP_STATE_PATH` for tests and smoke runs so you do not touch a real user's loop state.
 - All loop tools return `{ ..., loops }` for the session; the TUI sidebar parses that shape from tool outputs, so keep it stable.
-- Keep the repository-root `index.js` entrypoint and the committed `dist/` output in sync; OpenCode 2 loads this checkout directory through that entrypoint.
+- Keep the repository-root `index.js` and `tui.tsx` entrypoints and the committed `dist/` output in sync; OpenCode 2 loads this checkout directory through `index.js` for the server plugin and `tui.tsx` for the CLI/TUI plugin.
 
 ## Local Validation
 
@@ -68,4 +68,6 @@ OPENCODE_LOOP_STATE_PATH="/tmp/opencode-loop-plugin-smoke/loops.json" opencode r
 
 The smoke test should show `create_loop` (and possibly `stop_loop`) tool calls. Inspect the state file afterward to confirm JSON persistence, and clean up with `/loop stop <id>` or by deleting the smoke state file.
 
-OpenCode 2 loads a configured plugin directory through an `index.js` or `index.ts` entrypoint, so keep the repository-root `index.js` in place. Configured file paths are rejected and Git specifiers for packages with build scripts fail on OpenCode 2.0.16 (upstream opencode issues 49704 and 46551).
+To test the CLI/TUI entrypoint locally, add the same checkout directory to the global `~/.config/opencode/cli.json` `plugins` list and open the TUI (`opencode2 --standalone`). Confirm the debug log shows `entrypoint=.../tui.tsx` and `stage=setup plugin=local.loop-mode.tui` for `role=cli`. OpenCode 2.0.16 does not auto-load a directory plugin's TUI component from the server plugin list, so `cli.json` must list the checkout directory explicitly.
+
+OpenCode 2 loads a configured plugin directory through an `index.js`/`index.ts` entrypoint for the server and a `tui.tsx`/`tui.ts` entrypoint for the CLI, so keep the repository-root `index.js` and `tui.tsx` in place. Configured file paths are rejected and Git specifiers for packages with build scripts fail on OpenCode 2.0.16 (upstream opencode issues 49704 and 46551).

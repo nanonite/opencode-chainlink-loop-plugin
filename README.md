@@ -188,7 +188,19 @@ To load this local checkout instead of the npm package, add the checkout to the 
 }
 ```
 
-Run `bun install` and `bun run build` first. OpenCode 2 loads a configured plugin directory through an `index.js` or `index.ts` entrypoint, and this repository ships `index.js` for that purpose. Point the entry at the directory: OpenCode 2 rejects configured file paths with `configured plugin path must be a directory`. Then run `opencode reload` or restart the service.
+Run `bun install` and `bun run build` first. OpenCode 2 loads a configured plugin directory through an `index.js` or `index.ts` entrypoint for the server plugin, and a `tui.tsx` or `tui.ts` entrypoint for the CLI/TUI plugin; this repository ships `index.js` and `tui.tsx` for that purpose. Point the entry at the directory: OpenCode 2 rejects configured file paths with `configured plugin path must be a directory`. Then run `opencode reload` or restart the service.
+
+The sidebar and command palette render in the terminal client, which takes its plugin list from the global `~/.config/opencode/cli.json`. On OpenCode 2.0.16 a directory plugin declared in `opencode.json` is not auto-loaded into the CLI, so add the same checkout directory to `cli.json`:
+
+```jsonc
+// ~/.config/opencode/cli.json
+{
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": ["file:///path/to/opencode-chainlink-loop-plugin"]
+}
+```
+
+The CLI then reads `tui.tsx` from the directory and registers the sidebar and the `Loops` palette command.
 
 Git specifiers fail on OpenCode 2.0.16 for packages that declare build, prepare, or install scripts (upstream opencode issues 49704 and 46551). Until those fixes ship, load the checkout directory or use the npm package.
 
