@@ -67,5 +67,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
+        with:
+          # Keep this job byte-comparable: Bun releases may change bundle
+          # bytes. Bump this pin deliberately, together with a dist rebuild.
+          bun-version: "1.4.2"
       - run: bun install --frozen-lockfile
       - run: bun run check:dist
