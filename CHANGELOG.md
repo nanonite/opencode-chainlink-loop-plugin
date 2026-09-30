@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Add the TUI sidebar/palette for the loop plugin (cli.json) (#2)
 
 ### Fixed
+- Fix extractReview discarding genuine reviewer approvals when prose with brackets precedes the JSON verdict (#4)
 
 ### Changed
 - Publish the plugin under a controlled npm scope and recheck upstream install fixes (#3)

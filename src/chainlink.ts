@@ -233,24 +233,98 @@ export const EDIT_PERMISSION_TYPES = new Set(["edit", "write", "patch", "apply"]
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null}
 
-function parseJSON(text: string): unknown {
+function tryParseJSON(text: string): unknown {
   const trimmed = text.trim()
   if (!trimmed) return undefined
   try {
     return JSON.parse(trimmed) as unknown
   } catch {
-    const start = Math.min(...[trimmed.indexOf("{"), trimmed.indexOf("[")].filter((index) => index >= 0))
-    if (!Number.isFinite(start)) return undefined
-    const objectEnd = trimmed.lastIndexOf("}")
-    const arrayEnd = trimmed.lastIndexOf("]")
-    const end = Math.max(objectEnd, arrayEnd)
-    if (end <= start) return undefined
-    try {
-      return JSON.parse(trimmed.slice(start, end + 1)) as unknown
-    } catch {
-      return undefined
+    return undefined
+  }
+}
+
+/**
+ * Every balanced top-level `{...}` / `[...]` slice, in order of appearance and
+ * respecting quoted strings. The old fallback sliced from the first bracket to
+ * the last, so a bracket in the prose before the verdict (Markdown links,
+ * `[Unreleased]`, `{}`, a call like `pipeline.main([...])`) moved the slice start
+ * into the prose and made the JSON unparseable.
+ */
+function balancedJSONSpans(text: string): string[] {
+  const spans: string[] = []
+  let cursor = 0
+  while (cursor < text.length) {
+    const opener = text[cursor]
+    if (opener !== "{" && opener !== "[") {
+      cursor += 1
+      continue
+    }
+    const stack: string[] = []
+    let inString = false
+    let escaped = false
+    let end = -1
+    for (let index = cursor; index < text.length; index += 1) {
+      const char = text[index]!
+      if (inString) {
+        if (escaped) escaped = false
+        else if (char === "\\") escaped = true
+        else if (char === '"') inString = false
+        continue
+      }
+      if (char === '"') {
+        inString = true
+      } else if (char === "{" || char === "[") {
+        stack.push(char)
+      } else if (char === "}" || char === "]") {
+        const expected = char === "}" ? "{" : "["
+        if (stack[stack.length - 1] !== expected) break
+        stack.pop()
+        if (stack.length === 0) {
+          end = index + 1
+          break
+        }
+      }
+    }
+    if (end < 0) {
+      cursor += 1
+      continue
+    }
+    spans.push(text.slice(cursor, end))
+    cursor = end
+  }
+  return spans
+}
+
+function parseJSON(text: string): unknown {
+  const trimmed = text.trim()
+  if (!trimmed) return undefined
+  const direct = tryParseJSON(trimmed)
+  if (direct !== undefined) return direct
+
+  // Reviewer models usually narrate before the verdict. Prefer the last fenced
+  // block, then the last balanced JSON value that carries an `approved` verdict,
+  // then the last balanced value of any shape. Slicing from the first bracket is
+  // what discarded genuine approvals.
+  const fence = /```[ \t]*(?:json)?[ \t]*\r?\n?([\s\S]*?)```/gi
+  const fenced = [...trimmed.matchAll(fence)]
+  for (let index = fenced.length - 1; index >= 0; index -= 1) {
+    const parsed = tryParseJSON(fenced[index]![1]!)
+    if (parsed !== undefined) return parsed
+  }
+
+  const spans = balancedJSONSpans(trimmed)
+  let lastSpan: unknown
+  let sawSpan = false
+  for (let index = spans.length - 1; index >= 0; index -= 1) {
+    const parsed = tryParseJSON(spans[index]!)
+    if (parsed === undefined) continue
+    if (isRecord(parsed) && typeof parsed.approved === "boolean") return parsed
+    if (!sawSpan) {
+      lastSpan = parsed
+      sawSpan = true
     }
   }
+  return sawSpan ? lastSpan : undefined
 }
 
 export function taskFromUnknown(value: unknown): ChainlinkTask | undefined {

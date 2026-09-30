@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { feedbackPrompt, reviewerPrompt, workerPrompt, type ChainlinkTask } from "../src/chainlink"
+import { extractReview, feedbackPrompt, reviewerPrompt, workerPrompt, type ChainlinkTask } from "../src/chainlink"
 import { parseChainlinkArguments } from "../src/prompts"
 import type { ChainlinkWorkflowSnapshot } from "../src/state"
 
@@ -82,4 +82,93 @@ test("prompts omit the direction block when none is set", () => {
   expect(feedbackPrompt(workflow(), { approved: true, summary: "s", findings: [], nextAction: "n" })).not.toContain(
     "chainlink_direction",
   )
+})
+
+const approval = JSON.stringify({
+  approved: true,
+  summary: "looks good",
+  findings: [],
+  next_action: "finalize",
+})
+
+test("extractReview accepts a fenced approval after prose containing a Markdown link", () => {
+  const output = [
+    "Reviewed against the changelog:",
+    "",
+    "The `[Unreleased]` section is empty, which matches the task.",
+    "",
+    "```json",
+    approval,
+    "```",
+  ].join("\n")
+  const review = extractReview(output)
+  expect(review.approved).toBe(true)
+  expect(review.findings).toEqual([])
+})
+
+test("extractReview accepts a fenced approval after prose containing an empty object", () => {
+  const output = [
+    'The `{}` case is handled, as is the "work_package"-only case.',
+    "",
+    "```json",
+    approval,
+    "```",
+  ].join("\n")
+  expect(extractReview(output).approved).toBe(true)
+})
+
+test("extractReview accepts a bare verdict after prose containing a bracketed call", () => {
+  const output = [
+    'The tests cover `pipeline.main([... "report", "feature-ledger"])`.',
+    "",
+    approval,
+  ].join("\n")
+  expect(extractReview(output).approved).toBe(true)
+})
+
+test("extractReview accepts a fenced approval with trailing prose after the fence", () => {
+  const output = [
+    "Narrative before the verdict with a stray [bracket].",
+    "",
+    "```json",
+    approval,
+    "```",
+    "",
+    "Let me know if you want a deeper pass.",
+  ].join("\n")
+  expect(extractReview(output).approved).toBe(true)
+})
+
+test("extractReview is not fooled by a parseable object in prose after the verdict", () => {
+  const output = [approval, "", 'See the note `{"note": 1}` for details.'].join("\n")
+  expect(extractReview(output).approved).toBe(true)
+})
+
+test("extractReview prefers the last fenced block when several are present", () => {
+  const output = [
+    "```json",
+    '{"approved": false, "summary": "stale", "findings": ["stale"], "next_action": "n"}',
+    "```",
+    "",
+    "```json",
+    approval,
+    "```",
+  ].join("\n")
+  expect(extractReview(output).approved).toBe(true)
+})
+
+test("extractReview still rejects a genuinely malformed reply (fail closed)", () => {
+  const review = extractReview("I could not review this, sorry. No JSON here.")
+  expect(review.approved).toBe(false)
+  expect(review.findings).toEqual(["Reviewer output was not valid JSON."])
+})
+
+test("extractReview does not approve when findings are present", () => {
+  const output = JSON.stringify({
+    approved: true,
+    summary: "mostly fine",
+    findings: ["missing regression test"],
+    next_action: "add a test",
+  })
+  expect(extractReview(output).approved).toBe(false)
 })
