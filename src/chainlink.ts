@@ -391,13 +391,20 @@ export function truncate(input: string, maxChars = 20_000) {
   return input.length <= maxChars ? input : `${input.slice(0, maxChars)}\n[output truncated]`
 }
 
+/**
+ * The finding extractReview substitutes when the reviewer reply could not be
+ * parsed at all. Callers compare against it to tell a parse failure apart from a
+ * real one-finding rejection (see reviewLogLine in chainlink-process).
+ */
+export const REVIEW_PARSE_FAILURE = "Reviewer output was not valid JSON."
+
 export function extractReview(output: string): ChainlinkReview {
   const parsed = parseJSON(output)
   if (!isRecord(parsed)) {
     return {
       approved: false,
       summary: truncate(output),
-      findings: ["Reviewer output was not valid JSON."],
+      findings: [REVIEW_PARSE_FAILURE],
       nextAction: "Return strict JSON with approved, summary, findings, and next_action.",
     }
   }

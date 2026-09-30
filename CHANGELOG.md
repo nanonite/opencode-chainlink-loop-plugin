@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Add the TUI sidebar/palette for the loop plugin (cli.json) (#2)
 
 ### Fixed
+- Fix the chainlink-loop CLI silently dropping inner-loop progress lines (#5)
 - Fix extractReview discarding genuine reviewer approvals when prose with brackets precedes the JSON verdict (#4)
 
 ### Changed

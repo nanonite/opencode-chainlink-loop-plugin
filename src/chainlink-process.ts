@@ -9,6 +9,7 @@ import {
   fetchReadyTasks,
   fetchTaskById,
   normalizeTaskIds,
+  REVIEW_PARSE_FAILURE,
   reviewerPrompt,
   truncate,
   workerPrompt,
@@ -262,6 +263,21 @@ export async function detectExistingWork(cwd: string, task: ChainlinkTask, prior
 }
 
 /**
+ * One line describing a review outcome. A parse failure is called out explicitly
+ * so an operator can tell "the reviewer replied with prose we could not read"
+ * from "the reviewer raised one real finding" without opening the session
+ * database. Both look like `changes requested (1)` otherwise.
+ */
+export function reviewLogLine(taskID: string, attempt: number, review: ChainlinkReview): string {
+  const outcome = review.approved
+    ? "approved"
+    : review.findings.length === 1 && review.findings[0] === REVIEW_PARSE_FAILURE
+      ? "review parse failed (reviewer output was not JSON)"
+      : `changes requested (${review.findings.length})`
+  return `task ${taskID} attempt ${attempt}: ${outcome}`
+}
+
+/**
  * Runs one task to approval, exhaustion or failure using one-shot processes.
  * There is no model in the control path: this function picks the task, counts
  * the attempts and decides when to stop.
@@ -359,7 +375,7 @@ export async function runProcessInnerLoop(
 
     const review = await runReviewer(attempt)
     await recordChainlinkReview(workflow.id, "", JSON.stringify(review), attempt)
-    log(`task ${task.id} attempt ${attempt}: ${review.approved ? "approved" : `changes requested (${review.findings.length})`}`)
+    log(reviewLogLine(task.id, attempt, review))
 
     if (review.approved) {
       await recordChainlinkClosing(workflow.id)

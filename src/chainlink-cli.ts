@@ -9,7 +9,7 @@ import {
   type ProcessRunner,
   type ProcessStepInput,
 } from "./chainlink-process"
-import { execChainlinkCommand, parseModelRef } from "./chainlink"
+import { execChainlinkCommand, parseModelRef, type ChainlinkCommandRunner } from "./chainlink"
 import { acquireLoopLock, type LoopLock } from "./chainlink-lock"
 import { PLUGIN_NAME, formatBuildInfo } from "./version"
 
@@ -34,7 +34,7 @@ function parseJSON(text: string): unknown {
  *   bun run src/chainlink-cli.ts --task 67,71 --attempts 5
  *   bun run src/chainlink-cli.ts --prompt "keep changes minimal"
  */
-type Parsed = {
+export type ChainlinkCliArguments = {
   taskIds: string[] | null
   attempts: number
   maxTasks: number | null
@@ -87,8 +87,8 @@ Environment:
   CHAINLINK_PROMPT    Operator direction; overridden by --prompt.
 `
 
-function parseArgs(argv: string[]): Parsed {
-  const parsed: Parsed = {
+function parseArgs(argv: string[]): ChainlinkCliArguments {
+  const parsed: ChainlinkCliArguments = {
     taskIds: null,
     attempts: 20,
     maxTasks: null,
@@ -146,7 +146,7 @@ function parseArgs(argv: string[]): Parsed {
         parsed.closeOnApproval = true
         break
       case "--review-first":
-        parsed.reviewFirst = next() as Parsed["reviewFirst"]
+        parsed.reviewFirst = next() as ChainlinkCliArguments["reviewFirst"]
         break
       case "--exclude":
         parsed.excludeIDs.push(
@@ -195,8 +195,50 @@ function parseArgs(argv: string[]): Parsed {
   return parsed
 }
 
+export type BuildProcessLoopOptionsInput = {
+  ownerSessionID: string
+  cwd: string
+  parsed: ChainlinkCliArguments
+  step: ProcessRunner
+  runner: ChainlinkCommandRunner
+  log: (line: string) => void
+  dbPath: string | null
+}
+
+/**
+ * Builds the loop options. Kept separate from `main` so the wiring is testable
+ * without spawning processes: `log` was once omitted here, which silently
+ * swallowed every line runProcessLoop/runProcessInnerLoop emitted.
+ */
+export function buildProcessLoopOptions(input: BuildProcessLoopOptionsInput): ProcessLoopOptions {
+  return {
+    ownerSessionID: input.ownerSessionID,
+    cwd: input.cwd,
+    taskIds: input.parsed.taskIds,
+    maxAttempts: input.parsed.attempts,
+    maxTasks: input.parsed.maxTasks,
+    workerAgent: input.parsed.workerAgent,
+    reviewerAgent: input.parsed.reviewerAgent,
+    workerModel: parseModelRef(input.parsed.workerModel),
+    reviewerModel: parseModelRef(input.parsed.reviewerModel),
+    workerTimeoutSeconds: input.parsed.workerTimeout,
+    reviewerTimeoutSeconds: input.parsed.reviewerTimeout,
+    closeOnApproval: input.parsed.closeOnApproval,
+    reviewFirst: input.parsed.reviewFirst,
+    excludeIDs: input.parsed.excludeIDs,
+    customPrompt: input.parsed.customPrompt,
+    runner: input.runner,
+    step: input.step,
+    selectionArgs: ["issue", "next", "--json"],
+    showArgs: ["issue", "show", "--json"],
+    closeArgs: ["issue", "close", "--json"],
+    dbPath: input.dbPath,
+    log: input.log,
+  }
+}
+
 export async function main(argv: string[]) {
-  let parsed: Parsed
+  let parsed: ChainlinkCliArguments
   try {
     parsed = parseArgs(argv)
   } catch (error) {
@@ -225,29 +267,15 @@ export async function main(argv: string[]) {
     })
   }
 
-  const options: ProcessLoopOptions = {
+  const options = buildProcessLoopOptions({
     ownerSessionID,
     cwd,
-    taskIds: parsed.taskIds,
-    maxAttempts: parsed.attempts,
-    maxTasks: parsed.maxTasks,
-    workerAgent: parsed.workerAgent,
-    reviewerAgent: parsed.reviewerAgent,
-    workerModel: parseModelRef(parsed.workerModel),
-    reviewerModel: parseModelRef(parsed.reviewerModel),
-    workerTimeoutSeconds: parsed.workerTimeout,
-    reviewerTimeoutSeconds: parsed.reviewerTimeout,
-    closeOnApproval: parsed.closeOnApproval,
-    reviewFirst: parsed.reviewFirst,
-    excludeIDs: parsed.excludeIDs,
-    customPrompt: parsed.customPrompt,
-    runner: execChainlinkCommand,
+    parsed,
     step,
-    selectionArgs: ["issue", "next", "--json"],
-    showArgs: ["issue", "show", "--json"],
-    closeArgs: ["issue", "close", "--json"],
+    runner: execChainlinkCommand,
+    log,
     dbPath: process.env.CHAINLINK_DB ?? null,
-  }
+  })
 
   if (parsed.dryRun) {
     log(`build: ${formatBuildInfo()}`)
