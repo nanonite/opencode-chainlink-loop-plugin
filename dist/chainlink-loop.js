@@ -513,13 +513,14 @@ function truncate(input, maxChars = 20000) {
   return input.length <= maxChars ? input : `${input.slice(0, maxChars)}
 [output truncated]`;
 }
+var REVIEW_PARSE_FAILURE = "Reviewer output was not valid JSON.";
 function extractReview(output) {
   const parsed = parseJSON(output);
   if (!isRecord(parsed)) {
     return {
       approved: false,
       summary: truncate(output),
-      findings: ["Reviewer output was not valid JSON."],
+      findings: [REVIEW_PARSE_FAILURE],
       nextAction: "Return strict JSON with approved, summary, findings, and next_action."
     };
   }
@@ -825,6 +826,10 @@ async function detectExistingWork(cwd, task, priorWorkflows = []) {
   }
   return { existing: false, reason: "no prior work detected" };
 }
+function reviewLogLine(taskID, attempt, review) {
+  const outcome = review.approved ? "approved" : review.findings.length === 1 && review.findings[0] === REVIEW_PARSE_FAILURE ? "review parse failed (reviewer output was not JSON)" : `changes requested (${review.findings.length})`;
+  return `task ${taskID} attempt ${attempt}: ${outcome}`;
+}
 async function runProcessInnerLoop(options, workflow, task) {
   const log = options.log ?? (() => {
     return;
@@ -907,7 +912,7 @@ async function runProcessInnerLoop(options, workflow, task) {
     }
     const review = await runReviewer(attempt);
     await recordChainlinkReview(workflow.id, "", JSON.stringify(review), attempt);
-    log(`task ${task.id} attempt ${attempt}: ${review.approved ? "approved" : `changes requested (${review.findings.length})`}`);
+    log(reviewLogLine(task.id, attempt, review));
     if (review.approved) {
       await recordChainlinkClosing(workflow.id);
       if (options.closeOnApproval)
@@ -1063,8 +1068,8 @@ var injectedVersion = readString("0.2.0");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-17-g5eee260"),
-  gitSha: readString("5eee260"),
+  gitDescribe: readString("v0.1.8-19-g87ca9bc"),
+  gitSha: readString("87ca9bc"),
   gitDirty: false,
   source: injectedVersion ? "build" : "dev"
 };
@@ -1218,6 +1223,32 @@ function parseArgs(argv) {
   }
   return parsed;
 }
+function buildProcessLoopOptions(input) {
+  return {
+    ownerSessionID: input.ownerSessionID,
+    cwd: input.cwd,
+    taskIds: input.parsed.taskIds,
+    maxAttempts: input.parsed.attempts,
+    maxTasks: input.parsed.maxTasks,
+    workerAgent: input.parsed.workerAgent,
+    reviewerAgent: input.parsed.reviewerAgent,
+    workerModel: parseModelRef(input.parsed.workerModel),
+    reviewerModel: parseModelRef(input.parsed.reviewerModel),
+    workerTimeoutSeconds: input.parsed.workerTimeout,
+    reviewerTimeoutSeconds: input.parsed.reviewerTimeout,
+    closeOnApproval: input.parsed.closeOnApproval,
+    reviewFirst: input.parsed.reviewFirst,
+    excludeIDs: input.parsed.excludeIDs,
+    customPrompt: input.parsed.customPrompt,
+    runner: input.runner,
+    step: input.step,
+    selectionArgs: ["issue", "next", "--json"],
+    showArgs: ["issue", "show", "--json"],
+    closeArgs: ["issue", "close", "--json"],
+    dbPath: input.dbPath,
+    log: input.log
+  };
+}
 async function main(argv) {
   let parsed;
   try {
@@ -1249,29 +1280,15 @@ ${USAGE}`);
       onStart: (command, args) => log(`spawn: ${command} ${args.slice(0, -1).join(" ")} <prompt len ${input.prompt.length}>`)
     });
   };
-  const options = {
+  const options = buildProcessLoopOptions({
     ownerSessionID,
     cwd,
-    taskIds: parsed.taskIds,
-    maxAttempts: parsed.attempts,
-    maxTasks: parsed.maxTasks,
-    workerAgent: parsed.workerAgent,
-    reviewerAgent: parsed.reviewerAgent,
-    workerModel: parseModelRef(parsed.workerModel),
-    reviewerModel: parseModelRef(parsed.reviewerModel),
-    workerTimeoutSeconds: parsed.workerTimeout,
-    reviewerTimeoutSeconds: parsed.reviewerTimeout,
-    closeOnApproval: parsed.closeOnApproval,
-    reviewFirst: parsed.reviewFirst,
-    excludeIDs: parsed.excludeIDs,
-    customPrompt: parsed.customPrompt,
-    runner: execChainlinkCommand,
+    parsed,
     step,
-    selectionArgs: ["issue", "next", "--json"],
-    showArgs: ["issue", "show", "--json"],
-    closeArgs: ["issue", "close", "--json"],
+    runner: execChainlinkCommand,
+    log,
     dbPath: process.env.CHAINLINK_DB ?? null
-  };
+  });
   if (parsed.dryRun) {
     log(`build: ${formatBuildInfo()}`);
     log(`cwd: ${cwd}`);
@@ -1332,6 +1349,7 @@ if (invokedDirectly) {
   process.exit(code);
 }
 export {
+  buildProcessLoopOptions,
   collectStepOutput,
   main,
   opencodeRunArgs

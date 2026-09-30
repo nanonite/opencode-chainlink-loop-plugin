@@ -953,13 +953,14 @@ function truncate(input, maxChars = 20000) {
   return input.length <= maxChars ? input : `${input.slice(0, maxChars)}
 [output truncated]`;
 }
+var REVIEW_PARSE_FAILURE = "Reviewer output was not valid JSON.";
 function extractReview(output) {
   const parsed = parseJSON(output);
   if (!isRecord(parsed)) {
     return {
       approved: false,
       summary: truncate(output),
-      findings: ["Reviewer output was not valid JSON."],
+      findings: [REVIEW_PARSE_FAILURE],
       nextAction: "Return strict JSON with approved, summary, findings, and next_action."
     };
   }
@@ -1612,8 +1613,8 @@ var injectedVersion = readString("0.2.0");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-17-g5eee260"),
-  gitSha: readString("5eee260"),
+  gitDescribe: readString("v0.1.8-19-g87ca9bc"),
+  gitSha: readString("87ca9bc"),
   gitDirty: false,
   source: injectedVersion ? "build" : "dev"
 };
