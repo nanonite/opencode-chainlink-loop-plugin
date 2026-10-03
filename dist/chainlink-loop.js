@@ -283,7 +283,8 @@ async function recordChainlinkReviewerStarted(workflowID, reviewerSessionID) {
     if (workflow.status !== "running")
       throw new Error(`Chainlink workflow "${workflowID}" is ${workflow.status}`);
     workflow.phase = "reviewer";
-    workflow.reviewerSessionID = reviewerSessionID;
+    if (reviewerSessionID)
+      workflow.reviewerSessionID = reviewerSessionID;
     workflow.updatedAt = now();
     return workflowSnapshot(workflow);
   });
@@ -776,7 +777,8 @@ var spawnOpencodeRun = (input) => new Promise((resolve) => {
       exitCode,
       timedOut,
       aborted,
-      durationMs: Date.now() - started
+      durationMs: Date.now() - started,
+      stderr: stderr.trim()
     });
   };
   child.stdout?.on("data", (chunk) => {
@@ -788,7 +790,7 @@ var spawnOpencodeRun = (input) => new Promise((resolve) => {
       stderr = stderr.slice(-1e5);
   });
   child.on("error", (error) => {
-    stdout += `
+    stderr += `
 [failed to start opencode: ${error.message}]`;
     settle(null);
   });
@@ -850,8 +852,15 @@ async function runProcessInnerLoop(options, workflow, task) {
       title: `Chainlink ${task.id} reviewer ${attempt}`,
       signal: options.signal
     });
-    if (result.sessionID)
-      await recordChainlinkReviewerStarted(workflow.id, result.sessionID);
+    await recordChainlinkReviewerStarted(workflow.id, result.sessionID);
+    if (result.timedOut || result.aborted || result.exitCode !== 0) {
+      const reason = result.timedOut ? `timed out after ${options.reviewerTimeoutSeconds}s` : result.aborted ? "was cancelled" : result.exitCode == null ? "failed to start" : `exited with code ${result.exitCode}`;
+      const stderr = result.stderr.trim();
+      const message = `Chainlink reviewer ${attempt} for task ${task.id} ${reason} after ${result.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`;
+      log(message);
+      await failChainlinkWorkflow(workflow.id, message).catch(() => null);
+      throw new Error(message);
+    }
     return extractReview(result.text || "The reviewer returned no report.");
   };
   if (reviewFirst) {
@@ -901,12 +910,17 @@ async function runProcessInnerLoop(options, workflow, task) {
     }
     workerOutput = worker.text;
     if (worker.timedOut || worker.aborted) {
-      const reason = worker.timedOut ? `worker timed out after ${options.workerTimeoutSeconds}s` : "worker process was cancelled";
-      await failChainlinkWorkflow(workflow.id, `Chainlink ${task.id} ${reason}`);
-      return { status: "failed", error: `Chainlink ${task.id} ${reason}` };
+      const reason = worker.timedOut ? `timed out after ${options.workerTimeoutSeconds}s` : "process was cancelled";
+      const stderr = worker.stderr.trim();
+      log(`task ${task.id} attempt ${attempt}: worker ${reason} after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`);
+      const error = `Chainlink ${task.id} worker ${reason}`;
+      await failChainlinkWorkflow(workflow.id, `Chainlink ${task.id} worker ${reason}`);
+      return { status: "failed", error };
     }
     if (!workerOutput.trim()) {
-      const error = `Chainlink worker ${task.id} produced no report`;
+      const stderr = worker.stderr.trim();
+      const error = `Chainlink worker ${task.id} produced no report (exit ${worker.exitCode ?? "spawn error"}, ${worker.durationMs}ms)${stderr ? `: ${truncate(stderr, 300)}` : ""}`;
+      log(`task ${task.id} attempt ${attempt}: worker produced no report after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`);
       await failChainlinkWorkflow(workflow.id, error);
       return { status: "failed", error };
     }
@@ -1068,9 +1082,9 @@ var injectedVersion = readString("0.2.0");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-19-g87ca9bc"),
-  gitSha: readString("87ca9bc"),
-  gitDirty: false,
+  gitDescribe: readString("v0.1.8-20-ga647242"),
+  gitSha: readString("a647242"),
+  gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
 function formatBuildInfo(info = BUILD_INFO) {

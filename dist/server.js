@@ -404,7 +404,8 @@ async function recordChainlinkReviewerStarted(workflowID, reviewerSessionID) {
     if (workflow.status !== "running")
       throw new Error(`Chainlink workflow "${workflowID}" is ${workflow.status}`);
     workflow.phase = "reviewer";
-    workflow.reviewerSessionID = reviewerSessionID;
+    if (reviewerSessionID)
+      workflow.reviewerSessionID = reviewerSessionID;
     workflow.updatedAt = now();
     return workflowSnapshot(workflow);
   });
@@ -1613,9 +1614,9 @@ var injectedVersion = readString("0.2.0");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-19-g87ca9bc"),
-  gitSha: readString("87ca9bc"),
-  gitDirty: false,
+  gitDescribe: readString("v0.1.8-20-ga647242"),
+  gitSha: readString("a647242"),
+  gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
 function formatBuildInfo(info = BUILD_INFO) {

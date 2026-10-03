@@ -60,6 +60,7 @@ export type ProcessStepResult = {
   timedOut: boolean
   aborted: boolean
   durationMs: number
+  stderr: string
 }
 
 export type ProcessRunner = (input: ProcessStepInput) => Promise<ProcessStepResult>
@@ -159,6 +160,7 @@ export const spawnOpencodeRun: ProcessRunner = (input) =>
         timedOut,
         aborted,
         durationMs: Date.now() - started,
+        stderr: stderr.trim(),
       })
     }
 
@@ -170,7 +172,7 @@ export const spawnOpencodeRun: ProcessRunner = (input) =>
       if (stderr.length > 200_000) stderr = stderr.slice(-100_000)
     })
     child.on("error", (error) => {
-      stdout += `\n[failed to start opencode: ${error.message}]`
+      stderr += `\n[failed to start opencode: ${error.message}]`
       settle(null)
     })
     child.on("close", (code) => settle(code))
@@ -306,7 +308,24 @@ export async function runProcessInnerLoop(
       title: `Chainlink ${task.id} reviewer ${attempt}`,
       signal: options.signal,
     })
-    if (result.sessionID) await recordChainlinkReviewerStarted(workflow.id, result.sessionID)
+    // Record the phase move even when the step yielded no session ID; a
+    // reviewer that failed to start has none, and without "reviewer" the
+    // recordChainlinkReview below would die on a phase mismatch.
+    await recordChainlinkReviewerStarted(workflow.id, result.sessionID)
+    if (result.timedOut || result.aborted || result.exitCode !== 0) {
+      const reason = result.timedOut
+        ? `timed out after ${options.reviewerTimeoutSeconds}s`
+        : result.aborted
+          ? "was cancelled"
+          : result.exitCode == null
+            ? "failed to start"
+            : `exited with code ${result.exitCode}`
+      const stderr = result.stderr.trim()
+      const message = `Chainlink reviewer ${attempt} for task ${task.id} ${reason} after ${result.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`
+      log(message)
+      await failChainlinkWorkflow(workflow.id, message).catch(() => null)
+      throw new Error(message)
+    }
     return extractReview(result.text || "The reviewer returned no report.")
   }
 
@@ -362,13 +381,18 @@ export async function runProcessInnerLoop(
     workerOutput = worker.text
     if (worker.timedOut || worker.aborted) {
       const reason = worker.timedOut
-        ? `worker timed out after ${options.workerTimeoutSeconds}s`
-        : "worker process was cancelled"
-      await failChainlinkWorkflow(workflow.id, `Chainlink ${task.id} ${reason}`)
-      return { status: "failed", error: `Chainlink ${task.id} ${reason}` }
+        ? `timed out after ${options.workerTimeoutSeconds}s`
+        : "process was cancelled"
+      const stderr = worker.stderr.trim()
+      log(`task ${task.id} attempt ${attempt}: worker ${reason} after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`)
+      const error = `Chainlink ${task.id} worker ${reason}`
+      await failChainlinkWorkflow(workflow.id, `Chainlink ${task.id} worker ${reason}`)
+      return { status: "failed", error }
     }
     if (!workerOutput.trim()) {
-      const error = `Chainlink worker ${task.id} produced no report`
+      const stderr = worker.stderr.trim()
+      const error = `Chainlink worker ${task.id} produced no report (exit ${worker.exitCode ?? "spawn error"}, ${worker.durationMs}ms)${stderr ? `: ${truncate(stderr, 300)}` : ""}`
+      log(`task ${task.id} attempt ${attempt}: worker produced no report after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`)
       await failChainlinkWorkflow(workflow.id, error)
       return { status: "failed", error }
     }

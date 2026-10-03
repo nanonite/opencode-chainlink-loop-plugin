@@ -527,12 +527,15 @@ export async function recordChainlinkWorkerStall(workflowID: string) {
   })
 }
 
-export async function recordChainlinkReviewerStarted(workflowID: string, reviewerSessionID: string) {
+export async function recordChainlinkReviewerStarted(workflowID: string, reviewerSessionID: string | null) {
   return mutate((state) => {
     const workflow = requireOwnedWorkflow(state, workflowID)
     if (workflow.status !== "running") throw new Error(`Chainlink workflow "${workflowID}" is ${workflow.status}`)
+    // The phase move must not depend on getting a session ID: a reviewer step
+    // that fails to start has none, and without "reviewer" the subsequent
+    // recordChainlinkReview throws a phase mismatch.
     workflow.phase = "reviewer"
-    workflow.reviewerSessionID = reviewerSessionID
+    if (reviewerSessionID) workflow.reviewerSessionID = reviewerSessionID
     workflow.updatedAt = now()
     return workflowSnapshot(workflow)
   })
