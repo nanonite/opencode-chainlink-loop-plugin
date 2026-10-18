@@ -49,6 +49,10 @@ export type ChainlinkCliArguments = {
   reviewerTimeout: number
   /** Extra reviewer processes to start after one dies before delivering a verdict. */
   reviewerRetries: number
+  /** Kill a step that emits no output within this many seconds (0 disables). */
+  startupTimeout: number
+  /** Extra attempts for a step that never produced any output at all. */
+  startupRetries: number
   customPrompt: string | null
   dryRun: boolean
   version: boolean
@@ -81,6 +85,12 @@ Options:
                       dies before delivering a verdict (non-zero exit, spawn
                       error, timeout). A crash is retried, not treated as a
                       verdict; an operator abort is never retried. Default 1.
+  --startup-timeout <s> Kill a step that emits no output within this many seconds
+                      and retry it (default 300; 0 disables the watchdog). A step
+                      whose opencode run never creates a session would otherwise
+                      sit until its full per-step timeout.
+  --startup-retries <n> Retries for a step that never produced any output at all
+                      (default 1). The killed process group is logged.
   --prompt <text>     Operator direction layered above each task's notes; both
                       the worker and the reviewer follow it. Quote multi-word
                       values, e.g. --prompt "prefer the existing parser".
@@ -111,6 +121,8 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
     workerTimeout: Number(process.env.CHAINLINK_WORKER_TIMEOUT ?? 3600),
     reviewerTimeout: Number(process.env.CHAINLINK_REVIEWER_TIMEOUT ?? 1800),
     reviewerRetries: Number(process.env.CHAINLINK_REVIEWER_RETRIES ?? 1),
+    startupTimeout: Number(process.env.CHAINLINK_STARTUP_TIMEOUT ?? 300),
+    startupRetries: Number(process.env.CHAINLINK_STARTUP_RETRIES ?? 1),
     customPrompt: process.env.CHAINLINK_PROMPT ?? null,
     dryRun: false,
     version: false,
@@ -184,6 +196,12 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
       case "--reviewer-retries":
         parsed.reviewerRetries = Number(next())
         break
+      case "--startup-timeout":
+        parsed.startupTimeout = Number(next())
+        break
+      case "--startup-retries":
+        parsed.startupRetries = Number(next())
+        break
       case "--prompt":
         parsed.customPrompt = next()
         break
@@ -201,6 +219,12 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
   }
   if (!Number.isInteger(parsed.reviewerRetries) || parsed.reviewerRetries < 0) {
     throw new Error("--reviewer-retries must be a non-negative whole number")
+  }
+  if (!Number.isFinite(parsed.startupTimeout) || parsed.startupTimeout < 0) {
+    throw new Error("--startup-timeout must be a non-negative number")
+  }
+  if (!Number.isInteger(parsed.startupRetries) || parsed.startupRetries < 0) {
+    throw new Error("--startup-retries must be a non-negative whole number")
   }
   if (!["auto", "always", "never"].includes(parsed.reviewFirst)) {
     throw new Error("--review-first must be auto, always or never")
@@ -237,6 +261,8 @@ export function buildProcessLoopOptions(input: BuildProcessLoopOptionsInput): Pr
     workerTimeoutSeconds: input.parsed.workerTimeout,
     reviewerTimeoutSeconds: input.parsed.reviewerTimeout,
     reviewerStepRetries: input.parsed.reviewerRetries,
+    startupTimeoutSeconds: input.parsed.startupTimeout,
+    startupRetries: input.parsed.startupRetries,
     closeOnApproval: input.parsed.closeOnApproval,
     reviewFirst: input.parsed.reviewFirst,
     excludeIDs: input.parsed.excludeIDs,

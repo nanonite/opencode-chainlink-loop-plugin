@@ -140,6 +140,8 @@ bun run src/chainlink-cli.ts --task 67 --dry-run
 | `--worker-model` / `--reviewer-model` | `provider/model` per role. |
 | `--worker-agent` / `--reviewer-agent` | Defaults: `build` and `plan`. |
 | `--worker-timeout` / `--reviewer-timeout` | Per-step wall clock limit in seconds. |
+| `--startup-timeout <s>` | Kill a step that emits no output within this many seconds and retry it (default 300; 0 disables). Guards against a step whose `opencode run` never creates a session and would otherwise sit until its full per-step timeout. |
+| `--startup-retries <n>` | Extra attempts for a step that never produced any output at all (default 1). The killed process group is logged. |
 | `--dry-run` | Show the selected settings and, for one issue, whether existing work will be reviewed first. |
 | `-v`, `--version` | Print the plugin build version and exit. |
 

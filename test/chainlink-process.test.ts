@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { buildProcessLoopOptions, type ChainlinkCliArguments } from "../src/chainlink-cli"
-import { reviewLogLine, runProcessInnerLoop, type ProcessLoopOptions, type ProcessStepResult } from "../src/chainlink-process"
+import { reviewLogLine, runProcessInnerLoop, runStepProcess, type ProcessLoopOptions, type ProcessStepResult } from "../src/chainlink-process"
 import { extractReview, REVIEW_PARSE_FAILURE, type ChainlinkReview, type ChainlinkTask } from "../src/chainlink"
 import { createChainlinkWorkflow, getChainlinkWorkflow } from "../src/state"
 
@@ -47,12 +47,14 @@ test("buildProcessLoopOptions wires the logger through to the loop", () => {
     workerTimeout: 600,
     reviewerTimeout: 600,
     reviewerRetries: 1,
+    startupTimeout: 300,
+    startupRetries: 1,
     customPrompt: null,
     dryRun: false,
     version: false,
     help: false,
   }
-  const step = async () => ({ sessionID: null, text: "", exitCode: 0, timedOut: false, aborted: false, durationMs: 0, stderr: "" })
+  const step = async () => ({ sessionID: null, text: "", exitCode: 0, timedOut: false, startupTimedOut: false, aborted: false, durationMs: 0, stderr: "", pid: null })
   const runner = async () => ({ stdout: "", stderr: "" })
 
   const options = buildProcessLoopOptions({ ownerSessionID: "ses_x", cwd: "/tmp", parsed, step, runner, log, dbPath: null })
@@ -80,9 +82,11 @@ const stepResult = (overrides: Partial<ProcessStepResult>): ProcessStepResult =>
   text: "",
   exitCode: 0,
   timedOut: false,
+  startupTimedOut: false,
   aborted: false,
   durationMs: 1,
   stderr: "",
+  pid: null,
   ...overrides,
 })
 
@@ -103,6 +107,8 @@ const innerOptions = (step: ProcessLoopOptions["step"], logLines: string[]): Pro
     reviewerTimeoutSeconds: 1,
     // Retries are opt-in per test; the crash tests below set their own budget.
     reviewerStepRetries: 0,
+    startupTimeoutSeconds: 300,
+    startupRetries: 0,
     closeOnApproval: false,
     reviewFirst: "always",
     runner: async () => ({ stdout: "", stderr: "" }),
@@ -229,4 +235,57 @@ test("a reviewer cancelled by the operator is never retried (#8)", async () => {
 
   expect(reviewerRuns).toBe(1)
   expect(logLines.some((line) => line.includes("retrying reviewer"))).toBe(false)
+})
+
+test("the startup watchdog kills a step that produces no output (#7)", async () => {
+  const started = Date.now()
+  const result = await runStepProcess(
+    { cwd: dir, prompt: "", timeoutSeconds: 30, startupTimeoutSeconds: 0.3 },
+    "bash",
+    ["-c", "sleep 30"],
+  )
+
+  expect(result.startupTimedOut).toBe(true)
+  expect(result.timedOut).toBe(false)
+  expect(result.pid).toBeGreaterThan(0)
+  expect(result.text).toContain("did not start")
+  expect(Date.now() - started).toBeLessThan(5000)
+})
+
+test("the startup watchdog leaves a step that emits events alone (#7)", async () => {
+  const result = await runStepProcess(
+    { cwd: dir, prompt: "", timeoutSeconds: 10, startupTimeoutSeconds: 0.3 },
+    "bash",
+    ["-c", `echo '{"sessionID":"ses_x","type":"text","part":{"text":"hi"}}'; sleep 0.6`],
+  )
+
+  expect(result.startupTimedOut).toBe(false)
+  expect(result.sessionID).toBe("ses_x")
+  expect(result.exitCode).toBe(0)
+})
+
+test("a worker that never starts is retried once and then fails clearly (#7)", async () => {
+  const workflow = await workflowFor()
+  const logLines: string[] = []
+  let workerRuns = 0
+  const step: ProcessLoopOptions["step"] = async (input) => {
+    if (input.agent !== "build") return stepResult({ text: approval })
+    workerRuns += 1
+    return stepResult({ startupTimedOut: true, exitCode: null, durationMs: 300_000, pid: 4242 })
+  }
+  const options = {
+    ...innerOptions(step, logLines),
+    reviewFirst: "never" as const,
+    startupTimeoutSeconds: 300,
+    startupRetries: 1,
+  }
+
+  const result = await runProcessInnerLoop(options, workflow, task)
+
+  expect(result.status).toBe("failed")
+  expect(result.error).toMatch(/did not start \(no output after 300s/)
+  expect(workerRuns).toBe(2)
+  expect(logLines.some((line) => line.includes("killed process group 4242"))).toBe(true)
+  expect(logLines.some((line) => line.includes("retrying step (1/1)"))).toBe(true)
+  expect((await getChainlinkWorkflow(workflow.id))?.status).toBe("failed")
 })

@@ -44,6 +44,13 @@ export type ProcessStepInput = {
   cwd: string
   prompt: string
   timeoutSeconds: number
+  /**
+   * Kill the step if it has produced no output at all within this many seconds.
+   * A step whose `opencode run` never creates a session hangs silently until the
+   * total timeout, so the watchdog is the only thing that recovers it. 0 (or
+   * omitted) disables the watchdog.
+   */
+  startupTimeoutSeconds?: number
   agent?: string
   model?: ChainlinkModelRef | null
   sessionID?: string | null
@@ -57,10 +64,15 @@ export type ProcessStepResult = {
   sessionID: string | null
   text: string
   exitCode: number | null
+  /** The step hit its total timeout and was killed. */
   timedOut: boolean
+  /** The step produced no output inside the startup window and was killed. */
+  startupTimedOut: boolean
   aborted: boolean
   durationMs: number
   stderr: string
+  /** Process-group leader pid, so a timeout can report the tree it killed. */
+  pid: number | null
 }
 
 export type ProcessRunner = (input: ProcessStepInput) => Promise<ProcessStepResult>
@@ -102,23 +114,31 @@ export function collectStepOutput(stream: string): { sessionID: string | null; t
   return { sessionID, text: parts.join("\n\n").trim() }
 }
 
-export const spawnOpencodeRun: ProcessRunner = (input) =>
-  new Promise<ProcessStepResult>((resolve) => {
+/**
+ * Runs one step as a short-lived process in its own process group.
+ *
+ * Exported (rather than only reached through `spawnOpencodeRun`) so the startup
+ * watchdog can be exercised with a command that really does hang.
+ */
+export function runStepProcess(input: ProcessStepInput, command: string, args: string[]): Promise<ProcessStepResult> {
+  return new Promise<ProcessStepResult>((resolve) => {
     const started = Date.now()
-    const args = opencodeRunArgs(input)
-    input.onStart?.("opencode", args)
-    const child = spawn("opencode", args, {
+    input.onStart?.(command, args)
+    const child = spawn(command, args, {
       cwd: input.cwd,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
       // Own process group, so a timeout can take the server down with the CLI.
       detached: true,
     })
+    const pid = child.pid ?? null
     let stdout = ""
     let stderr = ""
     let timedOut = false
+    let startupTimedOut = false
     let aborted = false
     let settled = false
+    let sawOutput = false
 
     const kill = () => {
       try {
@@ -132,6 +152,17 @@ export const spawnOpencodeRun: ProcessRunner = (input) =>
       }
     }
 
+    const startupSeconds = input.startupTimeoutSeconds ?? 0
+    const startupTimer =
+      startupSeconds > 0
+        ? setTimeout(() => {
+            // Nothing at all came back, so this is not a slow step; waiting for
+            // the full timeout would only burn more wall time.
+            if (sawOutput) return
+            startupTimedOut = true
+            kill()
+          }, startupSeconds * 1000)
+        : undefined
     const timer =
       input.timeoutSeconds > 0
         ? setTimeout(() => {
@@ -149,34 +180,49 @@ export const spawnOpencodeRun: ProcessRunner = (input) =>
       if (settled) return
       settled = true
       if (timer) clearTimeout(timer)
+      if (startupTimer) clearTimeout(startupTimer)
       input.signal?.removeEventListener("abort", onAbort)
       const parsed = collectStepOutput(stdout)
+      // A timeout or abort truncates the stream; say so instead of relaying a
+      // half-written report as if it were complete.
+      const note = startupTimedOut ? "did not start" : timedOut ? "timed out" : aborted ? "aborted" : null
       resolve({
         sessionID: input.sessionID ?? parsed.sessionID,
-        // A timeout or abort truncates the stream; say so instead of relaying a
-        // half-written report as if it were complete.
-        text: timedOut || aborted ? `${parsed.text}\n\n[process ${timedOut ? "timed out" : "aborted"}]`.trim() : parsed.text,
+        text: note ? `${parsed.text}\n\n[process ${note}]`.trim() : parsed.text,
         exitCode,
         timedOut,
+        startupTimedOut,
         aborted,
         durationMs: Date.now() - started,
         stderr: stderr.trim(),
+        pid,
       })
     }
 
     child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8")
+      const text = chunk.toString("utf8")
+      // Only real event traffic cancels the watchdog: a byte-level banner does
+      // not mean the run is working.
+      if (!sawOutput && text.includes("{")) {
+        sawOutput = true
+        if (startupTimer) clearTimeout(startupTimer)
+      }
+      stdout += text
     })
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8")
       if (stderr.length > 200_000) stderr = stderr.slice(-100_000)
     })
     child.on("error", (error) => {
-      stderr += `\n[failed to start opencode: ${error.message}]`
+      stderr += `\n[failed to start ${command}: ${error.message}]`
       settle(null)
     })
     child.on("close", (code) => settle(code))
   })
+}
+
+export const spawnOpencodeRun: ProcessRunner = (input) =>
+  runStepProcess(input, "opencode", opencodeRunArgs(input))
 
 export type ProcessLoopOptions = {
   ownerSessionID: string
@@ -198,6 +244,18 @@ export type ProcessLoopOptions = {
    * retried.
    */
   reviewerStepRetries: number
+  /**
+   * Kill a step that emits no output within this many seconds (see
+   * `ProcessStepInput.startupTimeoutSeconds`). 0 disables the watchdog, which
+   * means a step that never starts waits out the whole per-step timeout.
+   */
+  startupTimeoutSeconds: number
+  /**
+   * Extra attempts for a step that never started (no output at all before the
+   * startup watchdog fired). A step that hangs at startup is stuck, not slow, so
+   * a fresh process is the only recovery.
+   */
+  startupRetries: number
   closeOnApproval: boolean
   /** "auto" reviews first when the tree already holds work for this task. */
   reviewFirst: "auto" | "always" | "never"
@@ -307,6 +365,28 @@ export async function runProcessInnerLoop(
   const reviewFirst = options.reviewFirst === "always" || (options.reviewFirst === "auto" && detection.existing)
 
   const reviewerStepRetries = Math.max(0, options.reviewerStepRetries ?? 0)
+  const startupRetries = Math.max(0, options.startupRetries ?? 0)
+
+  /**
+   * Runs a step, restarting a process that never produced any output. The
+   * startup watchdog has already killed the hung process; a step that never
+   * starts is stuck rather than slow, so a fresh process is the only recovery.
+   * An operator abort is never retried.
+   */
+  const runStep = async (input: Omit<ProcessStepInput, "startupTimeoutSeconds">): Promise<ProcessStepResult> => {
+    const request: ProcessStepInput = { ...input, startupTimeoutSeconds: options.startupTimeoutSeconds }
+    let result = await options.step(request)
+    for (let retry = 1; result.startupTimedOut && !input.signal?.aborted && retry <= startupRetries; retry += 1) {
+      const stderr = result.stderr.trim()
+      const killed = result.pid ? `process group ${result.pid}` : "the step"
+      log(
+        `step did not start (no output after ${options.startupTimeoutSeconds}s) after ${result.durationMs}ms; killed ${killed}` +
+          `${stderr ? `: ${truncate(stderr, 300)}` : ""}; retrying step (${retry}/${startupRetries})`,
+      )
+      result = await options.step(request)
+    }
+    return result
+  }
 
   /**
    * Runs the reviewer, retrying a step that dies before delivering a verdict.
@@ -318,7 +398,7 @@ export async function runProcessInnerLoop(
   const runReviewer = async (attempt: number): Promise<ChainlinkReview> => {
     let lastFailure: string | null = null
     for (let retry = 0; retry <= reviewerStepRetries; retry += 1) {
-      const result = await options.step({
+      const result = await runStep({
         cwd: options.cwd,
         prompt: reviewerPrompt(promptContext, task, attempt, workerOutput, options.customPrompt),
         timeoutSeconds: options.reviewerTimeoutSeconds,
@@ -331,20 +411,24 @@ export async function runProcessInnerLoop(
       // reviewer that failed to start has none, and without "reviewer" the
       // recordChainlinkReview below would die on a phase mismatch.
       await recordChainlinkReviewerStarted(workflow.id, result.sessionID)
-      if (!result.timedOut && !result.aborted && result.exitCode === 0) {
+      if (!result.timedOut && !result.startupTimedOut && !result.aborted && result.exitCode === 0) {
         return extractReview(result.text || "The reviewer returned no report.")
       }
       const reason = result.timedOut
         ? `timed out after ${options.reviewerTimeoutSeconds}s`
-        : result.aborted
-          ? "was cancelled"
-          : result.exitCode == null
-            ? "failed to start"
-            : `exited with code ${result.exitCode}`
+        : result.startupTimedOut
+          ? `did not start (no output after ${options.startupTimeoutSeconds}s)`
+          : result.aborted
+            ? "was cancelled"
+            : result.exitCode == null
+              ? "failed to start"
+              : `exited with code ${result.exitCode}`
       const stderr = result.stderr.trim()
       const message = `Chainlink reviewer ${attempt} for task ${task.id} ${reason} after ${result.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`
       lastFailure = message
-      const willRetry = !result.aborted && retry < reviewerStepRetries
+      // A startup hang was already retried by runStep; only other crashes use
+      // the reviewer budget, so the two retries do not compound.
+      const willRetry = !result.aborted && !result.startupTimedOut && retry < reviewerStepRetries
       log(willRetry ? `${message}; retrying reviewer (${retry + 1}/${reviewerStepRetries})` : message)
       if (!willRetry) break
     }
@@ -384,7 +468,7 @@ export async function runProcessInnerLoop(
     // findings, so the same session keeps its context instead of restarting.
     const prompt = pendingReview ? feedbackPrompt(promptContext, pendingReview, options.customPrompt) : workerPrompt(promptContext, task, attempt, undefined, options.customPrompt)
     log(`task ${task.id} attempt ${attempt}/${workflow.maxAttempts}: worker ${first ? "start" : "resume"}`)
-    const worker = await options.step({
+    const worker = await runStep({
       cwd: options.cwd,
       prompt,
       timeoutSeconds: options.workerTimeoutSeconds,
@@ -403,14 +487,25 @@ export async function runProcessInnerLoop(
       }
     }
     workerOutput = worker.text
+    if (worker.startupTimedOut) {
+      const stderr = worker.stderr.trim()
+      const error = `Chainlink ${task.id} worker did not start (no output after ${options.startupTimeoutSeconds}s after ${worker.durationMs}ms, exit ${worker.exitCode ?? "killed"})${stderr ? `: ${truncate(stderr, 300)}` : ""}`
+      log(`task ${task.id} attempt ${attempt}: worker did not start after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`)
+      await failChainlinkWorkflow(workflow.id, error)
+      return { status: "failed", error }
+    }
     if (worker.timedOut || worker.aborted) {
       const reason = worker.timedOut
         ? `timed out after ${options.workerTimeoutSeconds}s`
         : "process was cancelled"
       const stderr = worker.stderr.trim()
-      log(`task ${task.id} attempt ${attempt}: worker ${reason} after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`)
+      const killed = worker.pid ? `, process group ${worker.pid}` : ""
+      log(
+        `task ${task.id} attempt ${attempt}: worker ${reason} after ${worker.durationMs}ms (exit ${worker.exitCode ?? "killed"}${killed})` +
+          `${stderr ? `: ${truncate(stderr, 300)}` : ""}`,
+      )
       const error = `Chainlink ${task.id} worker ${reason}`
-      await failChainlinkWorkflow(workflow.id, `Chainlink ${task.id} worker ${reason}`)
+      await failChainlinkWorkflow(workflow.id, error)
       return { status: "failed", error }
     }
     if (!workerOutput.trim()) {
