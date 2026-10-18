@@ -842,26 +842,35 @@ async function runProcessInnerLoop(options, workflow, task) {
   let existingWork = false;
   const detection = await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID));
   const reviewFirst = options.reviewFirst === "always" || options.reviewFirst === "auto" && detection.existing;
+  const reviewerStepRetries = Math.max(0, options.reviewerStepRetries ?? 0);
   const runReviewer = async (attempt) => {
-    const result = await options.step({
-      cwd: options.cwd,
-      prompt: reviewerPrompt(promptContext, task, attempt, workerOutput, options.customPrompt),
-      timeoutSeconds: options.reviewerTimeoutSeconds,
-      agent: options.reviewerAgent,
-      model: options.reviewerModel,
-      title: `Chainlink ${task.id} reviewer ${attempt}`,
-      signal: options.signal
-    });
-    await recordChainlinkReviewerStarted(workflow.id, result.sessionID);
-    if (result.timedOut || result.aborted || result.exitCode !== 0) {
+    let lastFailure = null;
+    for (let retry = 0;retry <= reviewerStepRetries; retry += 1) {
+      const result = await options.step({
+        cwd: options.cwd,
+        prompt: reviewerPrompt(promptContext, task, attempt, workerOutput, options.customPrompt),
+        timeoutSeconds: options.reviewerTimeoutSeconds,
+        agent: options.reviewerAgent,
+        model: options.reviewerModel,
+        title: `Chainlink ${task.id} reviewer ${attempt}`,
+        signal: options.signal
+      });
+      await recordChainlinkReviewerStarted(workflow.id, result.sessionID);
+      if (!result.timedOut && !result.aborted && result.exitCode === 0) {
+        return extractReview(result.text || "The reviewer returned no report.");
+      }
       const reason = result.timedOut ? `timed out after ${options.reviewerTimeoutSeconds}s` : result.aborted ? "was cancelled" : result.exitCode == null ? "failed to start" : `exited with code ${result.exitCode}`;
       const stderr = result.stderr.trim();
       const message = `Chainlink reviewer ${attempt} for task ${task.id} ${reason} after ${result.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`;
-      log(message);
-      await failChainlinkWorkflow(workflow.id, message).catch(() => null);
-      throw new Error(message);
+      lastFailure = message;
+      const willRetry = !result.aborted && retry < reviewerStepRetries;
+      log(willRetry ? `${message}; retrying reviewer (${retry + 1}/${reviewerStepRetries})` : message);
+      if (!willRetry)
+        break;
     }
-    return extractReview(result.text || "The reviewer returned no report.");
+    const message = lastFailure ?? `Chainlink reviewer ${attempt} for task ${task.id} failed to start`;
+    await failChainlinkWorkflow(workflow.id, message).catch(() => null);
+    throw new Error(message);
   };
   if (reviewFirst) {
     existingWork = true;
@@ -1082,9 +1091,9 @@ var injectedVersion = readString("0.2.0");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-22-g0522b01"),
-  gitSha: readString("0522b01"),
-  gitDirty: false,
+  gitDescribe: readString("v0.1.8-24-g905073a"),
+  gitSha: readString("905073a"),
+  gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
 function formatBuildInfo(info = BUILD_INFO) {
@@ -1127,6 +1136,10 @@ Options:
   --reviewer-agent <a> Agent for the reviewer (default plan; plan cannot edit files).
   --worker-timeout <s>   Per-step worker timeout in seconds (default 3600).
   --reviewer-timeout <s> Per-step reviewer timeout in seconds (default 1800).
+  --reviewer-retries <n> Extra reviewer processes to start when a reviewer step
+                      dies before delivering a verdict (non-zero exit, spawn
+                      error, timeout). A crash is retried, not treated as a
+                      verdict; an operator abort is never retried. Default 1.
   --prompt <text>     Operator direction layered above each task's notes; both
                       the worker and the reviewer follow it. Quote multi-word
                       values, e.g. --prompt "prefer the existing parser".
@@ -1152,6 +1165,7 @@ function parseArgs(argv) {
     reviewerAgent: process.env.CHAINLINK_REVIEWER_AGENT ?? "plan",
     workerTimeout: Number(process.env.CHAINLINK_WORKER_TIMEOUT ?? 3600),
     reviewerTimeout: Number(process.env.CHAINLINK_REVIEWER_TIMEOUT ?? 1800),
+    reviewerRetries: Number(process.env.CHAINLINK_REVIEWER_RETRIES ?? 1),
     customPrompt: process.env.CHAINLINK_PROMPT ?? null,
     dryRun: false,
     version: false,
@@ -1215,6 +1229,9 @@ function parseArgs(argv) {
       case "--reviewer-timeout":
         parsed.reviewerTimeout = Number(next());
         break;
+      case "--reviewer-retries":
+        parsed.reviewerRetries = Number(next());
+        break;
       case "--prompt":
         parsed.customPrompt = next();
         break;
@@ -1231,6 +1248,9 @@ function parseArgs(argv) {
     throw new Error("--worker-timeout must be positive");
   if (!Number.isFinite(parsed.reviewerTimeout) || parsed.reviewerTimeout < 1) {
     throw new Error("--reviewer-timeout must be positive");
+  }
+  if (!Number.isInteger(parsed.reviewerRetries) || parsed.reviewerRetries < 0) {
+    throw new Error("--reviewer-retries must be a non-negative whole number");
   }
   if (!["auto", "always", "never"].includes(parsed.reviewFirst)) {
     throw new Error("--review-first must be auto, always or never");
@@ -1250,6 +1270,7 @@ function buildProcessLoopOptions(input) {
     reviewerModel: parseModelRef(input.parsed.reviewerModel),
     workerTimeoutSeconds: input.parsed.workerTimeout,
     reviewerTimeoutSeconds: input.parsed.reviewerTimeout,
+    reviewerStepRetries: input.parsed.reviewerRetries,
     closeOnApproval: input.parsed.closeOnApproval,
     reviewFirst: input.parsed.reviewFirst,
     excludeIDs: input.parsed.excludeIDs,
