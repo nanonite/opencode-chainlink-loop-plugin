@@ -727,75 +727,98 @@ function collectStepOutput(stream) {
 
 `).trim() };
 }
-var spawnOpencodeRun = (input) => new Promise((resolve) => {
-  const started = Date.now();
-  const args = opencodeRunArgs(input);
-  input.onStart?.("opencode", args);
-  const child = spawn("opencode", args, {
-    cwd: input.cwd,
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: true
-  });
-  let stdout = "";
-  let stderr = "";
-  let timedOut = false;
-  let aborted = false;
-  let settled = false;
-  const kill = () => {
-    try {
-      if (child.pid)
-        process.kill(-child.pid, "SIGKILL");
-    } catch {
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-    }
-  };
-  const timer = input.timeoutSeconds > 0 ? setTimeout(() => {
-    timedOut = true;
-    kill();
-  }, input.timeoutSeconds * 1000) : undefined;
-  const onAbort = () => {
-    aborted = true;
-    kill();
-  };
-  input.signal?.addEventListener("abort", onAbort, { once: true });
-  const settle = (exitCode) => {
-    if (settled)
-      return;
-    settled = true;
-    if (timer)
-      clearTimeout(timer);
-    input.signal?.removeEventListener("abort", onAbort);
-    const parsed = collectStepOutput(stdout);
-    resolve({
-      sessionID: input.sessionID ?? parsed.sessionID,
-      text: timedOut || aborted ? `${parsed.text}
-
-[process ${timedOut ? "timed out" : "aborted"}]`.trim() : parsed.text,
-      exitCode,
-      timedOut,
-      aborted,
-      durationMs: Date.now() - started,
-      stderr: stderr.trim()
+function runStepProcess(input, command, args) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    input.onStart?.(command, args);
+    const child = spawn(command, args, {
+      cwd: input.cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true
     });
-  };
-  child.stdout?.on("data", (chunk) => {
-    stdout += chunk.toString("utf8");
+    const pid = child.pid ?? null;
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let startupTimedOut = false;
+    let aborted = false;
+    let settled = false;
+    let sawOutput = false;
+    const kill = () => {
+      try {
+        if (child.pid)
+          process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }
+    };
+    const startupSeconds = input.startupTimeoutSeconds ?? 0;
+    const startupTimer = startupSeconds > 0 ? setTimeout(() => {
+      if (sawOutput)
+        return;
+      startupTimedOut = true;
+      kill();
+    }, startupSeconds * 1000) : undefined;
+    const timer = input.timeoutSeconds > 0 ? setTimeout(() => {
+      timedOut = true;
+      kill();
+    }, input.timeoutSeconds * 1000) : undefined;
+    const onAbort = () => {
+      aborted = true;
+      kill();
+    };
+    input.signal?.addEventListener("abort", onAbort, { once: true });
+    const settle = (exitCode) => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer)
+        clearTimeout(timer);
+      if (startupTimer)
+        clearTimeout(startupTimer);
+      input.signal?.removeEventListener("abort", onAbort);
+      const parsed = collectStepOutput(stdout);
+      const note = startupTimedOut ? "did not start" : timedOut ? "timed out" : aborted ? "aborted" : null;
+      resolve({
+        sessionID: input.sessionID ?? parsed.sessionID,
+        text: note ? `${parsed.text}
+
+[process ${note}]`.trim() : parsed.text,
+        exitCode,
+        timedOut,
+        startupTimedOut,
+        aborted,
+        durationMs: Date.now() - started,
+        stderr: stderr.trim(),
+        pid
+      });
+    };
+    child.stdout?.on("data", (chunk) => {
+      const text = chunk.toString("utf8");
+      if (!sawOutput && text.includes("{")) {
+        sawOutput = true;
+        if (startupTimer)
+          clearTimeout(startupTimer);
+      }
+      stdout += text;
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+      if (stderr.length > 200000)
+        stderr = stderr.slice(-1e5);
+    });
+    child.on("error", (error) => {
+      stderr += `
+[failed to start ${command}: ${error.message}]`;
+      settle(null);
+    });
+    child.on("close", (code) => settle(code));
   });
-  child.stderr?.on("data", (chunk) => {
-    stderr += chunk.toString("utf8");
-    if (stderr.length > 200000)
-      stderr = stderr.slice(-1e5);
-  });
-  child.on("error", (error) => {
-    stderr += `
-[failed to start opencode: ${error.message}]`;
-    settle(null);
-  });
-  child.on("close", (code) => settle(code));
-});
+}
+var spawnOpencodeRun = (input) => runStepProcess(input, "opencode", opencodeRunArgs(input));
 function gitRunner(args, cwd) {
   return new Promise((resolve) => {
     const child = spawn("git", [...args], { cwd, stdio: ["ignore", "pipe", "ignore"] });
@@ -843,10 +866,22 @@ async function runProcessInnerLoop(options, workflow, task) {
   const detection = await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID));
   const reviewFirst = options.reviewFirst === "always" || options.reviewFirst === "auto" && detection.existing;
   const reviewerStepRetries = Math.max(0, options.reviewerStepRetries ?? 0);
+  const startupRetries = Math.max(0, options.startupRetries ?? 0);
+  const runStep = async (input) => {
+    const request = { ...input, startupTimeoutSeconds: options.startupTimeoutSeconds };
+    let result = await options.step(request);
+    for (let retry = 1;result.startupTimedOut && !input.signal?.aborted && retry <= startupRetries; retry += 1) {
+      const stderr = result.stderr.trim();
+      const killed = result.pid ? `process group ${result.pid}` : "the step";
+      log(`step did not start (no output after ${options.startupTimeoutSeconds}s) after ${result.durationMs}ms; killed ${killed}` + `${stderr ? `: ${truncate(stderr, 300)}` : ""}; retrying step (${retry}/${startupRetries})`);
+      result = await options.step(request);
+    }
+    return result;
+  };
   const runReviewer = async (attempt) => {
     let lastFailure = null;
     for (let retry = 0;retry <= reviewerStepRetries; retry += 1) {
-      const result = await options.step({
+      const result = await runStep({
         cwd: options.cwd,
         prompt: reviewerPrompt(promptContext, task, attempt, workerOutput, options.customPrompt),
         timeoutSeconds: options.reviewerTimeoutSeconds,
@@ -856,14 +891,14 @@ async function runProcessInnerLoop(options, workflow, task) {
         signal: options.signal
       });
       await recordChainlinkReviewerStarted(workflow.id, result.sessionID);
-      if (!result.timedOut && !result.aborted && result.exitCode === 0) {
+      if (!result.timedOut && !result.startupTimedOut && !result.aborted && result.exitCode === 0) {
         return extractReview(result.text || "The reviewer returned no report.");
       }
-      const reason = result.timedOut ? `timed out after ${options.reviewerTimeoutSeconds}s` : result.aborted ? "was cancelled" : result.exitCode == null ? "failed to start" : `exited with code ${result.exitCode}`;
+      const reason = result.timedOut ? `timed out after ${options.reviewerTimeoutSeconds}s` : result.startupTimedOut ? `did not start (no output after ${options.startupTimeoutSeconds}s)` : result.aborted ? "was cancelled" : result.exitCode == null ? "failed to start" : `exited with code ${result.exitCode}`;
       const stderr = result.stderr.trim();
       const message = `Chainlink reviewer ${attempt} for task ${task.id} ${reason} after ${result.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`;
       lastFailure = message;
-      const willRetry = !result.aborted && retry < reviewerStepRetries;
+      const willRetry = !result.aborted && !result.startupTimedOut && retry < reviewerStepRetries;
       log(willRetry ? `${message}; retrying reviewer (${retry + 1}/${reviewerStepRetries})` : message);
       if (!willRetry)
         break;
@@ -899,7 +934,7 @@ async function runProcessInnerLoop(options, workflow, task) {
     const first = attempt === 1 && !existingWork && !pendingReview;
     const prompt = pendingReview ? feedbackPrompt(promptContext, pendingReview, options.customPrompt) : workerPrompt(promptContext, task, attempt, undefined, options.customPrompt);
     log(`task ${task.id} attempt ${attempt}/${workflow.maxAttempts}: worker ${first ? "start" : "resume"}`);
-    const worker = await options.step({
+    const worker = await runStep({
       cwd: options.cwd,
       prompt,
       timeoutSeconds: options.workerTimeoutSeconds,
@@ -918,12 +953,20 @@ async function runProcessInnerLoop(options, workflow, task) {
       }
     }
     workerOutput = worker.text;
+    if (worker.startupTimedOut) {
+      const stderr = worker.stderr.trim();
+      const error = `Chainlink ${task.id} worker did not start (no output after ${options.startupTimeoutSeconds}s after ${worker.durationMs}ms, exit ${worker.exitCode ?? "killed"})${stderr ? `: ${truncate(stderr, 300)}` : ""}`;
+      log(`task ${task.id} attempt ${attempt}: worker did not start after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`);
+      await failChainlinkWorkflow(workflow.id, error);
+      return { status: "failed", error };
+    }
     if (worker.timedOut || worker.aborted) {
       const reason = worker.timedOut ? `timed out after ${options.workerTimeoutSeconds}s` : "process was cancelled";
       const stderr = worker.stderr.trim();
-      log(`task ${task.id} attempt ${attempt}: worker ${reason} after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`);
+      const killed = worker.pid ? `, process group ${worker.pid}` : "";
+      log(`task ${task.id} attempt ${attempt}: worker ${reason} after ${worker.durationMs}ms (exit ${worker.exitCode ?? "killed"}${killed})` + `${stderr ? `: ${truncate(stderr, 300)}` : ""}`);
       const error = `Chainlink ${task.id} worker ${reason}`;
-      await failChainlinkWorkflow(workflow.id, `Chainlink ${task.id} worker ${reason}`);
+      await failChainlinkWorkflow(workflow.id, error);
       return { status: "failed", error };
     }
     if (!workerOutput.trim()) {
@@ -1087,12 +1130,12 @@ var PLUGIN_NAME = "@prevalentware/opencode-loop-plugin";
 function readString(value) {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
-var injectedVersion = readString("0.2.1");
+var injectedVersion = readString("0.2.2");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-27-gbca8ab9"),
-  gitSha: readString("bca8ab9"),
+  gitDescribe: readString("v0.1.8-30-ga8f166b"),
+  gitSha: readString("a8f166b"),
   gitDirty: false,
   source: injectedVersion ? "build" : "dev"
 };
@@ -1140,6 +1183,12 @@ Options:
                       dies before delivering a verdict (non-zero exit, spawn
                       error, timeout). A crash is retried, not treated as a
                       verdict; an operator abort is never retried. Default 1.
+  --startup-timeout <s> Kill a step that emits no output within this many seconds
+                      and retry it (default 300; 0 disables the watchdog). A step
+                      whose opencode run never creates a session would otherwise
+                      sit until its full per-step timeout.
+  --startup-retries <n> Retries for a step that never produced any output at all
+                      (default 1). The killed process group is logged.
   --prompt <text>     Operator direction layered above each task's notes; both
                       the worker and the reviewer follow it. Quote multi-word
                       values, e.g. --prompt "prefer the existing parser".
@@ -1166,6 +1215,8 @@ function parseArgs(argv) {
     workerTimeout: Number(process.env.CHAINLINK_WORKER_TIMEOUT ?? 3600),
     reviewerTimeout: Number(process.env.CHAINLINK_REVIEWER_TIMEOUT ?? 1800),
     reviewerRetries: Number(process.env.CHAINLINK_REVIEWER_RETRIES ?? 1),
+    startupTimeout: Number(process.env.CHAINLINK_STARTUP_TIMEOUT ?? 300),
+    startupRetries: Number(process.env.CHAINLINK_STARTUP_RETRIES ?? 1),
     customPrompt: process.env.CHAINLINK_PROMPT ?? null,
     dryRun: false,
     version: false,
@@ -1232,6 +1283,12 @@ function parseArgs(argv) {
       case "--reviewer-retries":
         parsed.reviewerRetries = Number(next());
         break;
+      case "--startup-timeout":
+        parsed.startupTimeout = Number(next());
+        break;
+      case "--startup-retries":
+        parsed.startupRetries = Number(next());
+        break;
       case "--prompt":
         parsed.customPrompt = next();
         break;
@@ -1252,6 +1309,12 @@ function parseArgs(argv) {
   if (!Number.isInteger(parsed.reviewerRetries) || parsed.reviewerRetries < 0) {
     throw new Error("--reviewer-retries must be a non-negative whole number");
   }
+  if (!Number.isFinite(parsed.startupTimeout) || parsed.startupTimeout < 0) {
+    throw new Error("--startup-timeout must be a non-negative number");
+  }
+  if (!Number.isInteger(parsed.startupRetries) || parsed.startupRetries < 0) {
+    throw new Error("--startup-retries must be a non-negative whole number");
+  }
   if (!["auto", "always", "never"].includes(parsed.reviewFirst)) {
     throw new Error("--review-first must be auto, always or never");
   }
@@ -1271,6 +1334,8 @@ function buildProcessLoopOptions(input) {
     workerTimeoutSeconds: input.parsed.workerTimeout,
     reviewerTimeoutSeconds: input.parsed.reviewerTimeout,
     reviewerStepRetries: input.parsed.reviewerRetries,
+    startupTimeoutSeconds: input.parsed.startupTimeout,
+    startupRetries: input.parsed.startupRetries,
     closeOnApproval: input.parsed.closeOnApproval,
     reviewFirst: input.parsed.reviewFirst,
     excludeIDs: input.parsed.excludeIDs,
