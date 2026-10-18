@@ -46,6 +46,7 @@ test("buildProcessLoopOptions wires the logger through to the loop", () => {
     reviewerAgent: "plan",
     workerTimeout: 600,
     reviewerTimeout: 600,
+    reviewerRetries: 1,
     customPrompt: null,
     dryRun: false,
     version: false,
@@ -100,6 +101,8 @@ const innerOptions = (step: ProcessLoopOptions["step"], logLines: string[]): Pro
     reviewerModel: null,
     workerTimeoutSeconds: 1,
     reviewerTimeoutSeconds: 1,
+    // Retries are opt-in per test; the crash tests below set their own budget.
+    reviewerStepRetries: 0,
     closeOnApproval: false,
     reviewFirst: "always",
     runner: async () => ({ stdout: "", stderr: "" }),
@@ -157,4 +160,73 @@ test("a reviewer step that fails to start fails the workflow with exit code, std
   expect(persisted?.lastError).toContain("exited with code 1")
   expect(persisted?.lastError).toContain("model not found")
   expect(logLines.some((line) => line.includes("model not found") && line.includes("42ms"))).toBe(true)
+})
+
+const approval = JSON.stringify({ approved: true, summary: "lgtm", findings: [], next_action: "close it" })
+
+async function workflowFor(maxAttempts = 2) {
+  return createChainlinkWorkflow({
+    ownerSessionID: "ses_test",
+    taskID: task.id,
+    taskTitle: task.title,
+    taskJSON: JSON.stringify(task),
+    maxAttempts,
+    ownerPid: process.pid,
+  })
+}
+
+test("a transient reviewer crash is retried and the review still lands (#8)", async () => {
+  const workflow = await workflowFor()
+  const logLines: string[] = []
+  let reviewerRuns = 0
+  const step: ProcessLoopOptions["step"] = async (input) => {
+    if (input.agent !== "plan") return stepResult({ text: "did the work" })
+    reviewerRuns += 1
+    return reviewerRuns === 1
+      ? stepResult({ exitCode: 1, stderr: "reviewer died", durationMs: 210_000 })
+      : stepResult({ text: approval })
+  }
+  const options = { ...innerOptions(step, logLines), reviewFirst: "never" as const, reviewerStepRetries: 1 }
+
+  const result = await runProcessInnerLoop(options, workflow, task)
+
+  expect(result.status).toBe("completed")
+  expect(reviewerRuns).toBe(2)
+  expect((await getChainlinkWorkflow(workflow.id))?.status).toBe("completed")
+  expect(logLines.some((line) => line.includes("retrying reviewer (1/1)"))).toBe(true)
+})
+
+test("a reviewer that keeps crashing fails the task only after its retry budget (#8)", async () => {
+  const workflow = await workflowFor()
+  const logLines: string[] = []
+  let reviewerRuns = 0
+  const step: ProcessLoopOptions["step"] = async (input) => {
+    if (input.agent !== "plan") return stepResult({ text: "did the work" })
+    reviewerRuns += 1
+    return stepResult({ exitCode: 1, stderr: "still dead", durationMs: 5 })
+  }
+  const options = { ...innerOptions(step, logLines), reviewFirst: "never" as const, reviewerStepRetries: 2 }
+
+  await expect(runProcessInnerLoop(options, workflow, task)).rejects.toThrow(/exited with code 1.*still dead/)
+
+  expect(reviewerRuns).toBe(3)
+  expect((await getChainlinkWorkflow(workflow.id))?.status).toBe("failed")
+  expect(logLines.filter((line) => line.includes("retrying reviewer")).length).toBe(2)
+})
+
+test("a reviewer cancelled by the operator is never retried (#8)", async () => {
+  const workflow = await workflowFor()
+  const logLines: string[] = []
+  let reviewerRuns = 0
+  const step: ProcessLoopOptions["step"] = async (input) => {
+    if (input.agent !== "plan") return stepResult({ text: "did the work" })
+    reviewerRuns += 1
+    return stepResult({ aborted: true, exitCode: null, durationMs: 12 })
+  }
+  const options = { ...innerOptions(step, logLines), reviewFirst: "never" as const, reviewerStepRetries: 3 }
+
+  await expect(runProcessInnerLoop(options, workflow, task)).rejects.toThrow(/was cancelled/)
+
+  expect(reviewerRuns).toBe(1)
+  expect(logLines.some((line) => line.includes("retrying reviewer"))).toBe(false)
 })

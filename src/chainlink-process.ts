@@ -190,6 +190,14 @@ export type ProcessLoopOptions = {
   reviewerModel: ChainlinkModelRef | null
   workerTimeoutSeconds: number
   reviewerTimeoutSeconds: number
+  /**
+   * How many extra reviewer processes to start when a reviewer step dies before
+   * it can deliver a verdict (non-zero exit, spawn error, timeout). A reviewer
+   * crash says nothing about the task's work, so the first one must not fail the
+   * task — let alone abandon the rest of the queue. An operator abort is never
+   * retried.
+   */
+  reviewerStepRetries: number
   closeOnApproval: boolean
   /** "auto" reviews first when the tree already holds work for this task. */
   reviewFirst: "auto" | "always" | "never"
@@ -298,21 +306,34 @@ export async function runProcessInnerLoop(
   const detection = await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID))
   const reviewFirst = options.reviewFirst === "always" || (options.reviewFirst === "auto" && detection.existing)
 
+  const reviewerStepRetries = Math.max(0, options.reviewerStepRetries ?? 0)
+
+  /**
+   * Runs the reviewer, retrying a step that dies before delivering a verdict.
+   * A crash (non-zero exit, spawn error, timeout) is an infrastructure failure,
+   * not a verdict on the task: it says nothing about the work under review, so
+   * failing the whole queue on the first one is both surprising and expensive.
+   * An operator abort is the one failure that is never retried.
+   */
   const runReviewer = async (attempt: number): Promise<ChainlinkReview> => {
-    const result = await options.step({
-      cwd: options.cwd,
-      prompt: reviewerPrompt(promptContext, task, attempt, workerOutput, options.customPrompt),
-      timeoutSeconds: options.reviewerTimeoutSeconds,
-      agent: options.reviewerAgent,
-      model: options.reviewerModel,
-      title: `Chainlink ${task.id} reviewer ${attempt}`,
-      signal: options.signal,
-    })
-    // Record the phase move even when the step yielded no session ID; a
-    // reviewer that failed to start has none, and without "reviewer" the
-    // recordChainlinkReview below would die on a phase mismatch.
-    await recordChainlinkReviewerStarted(workflow.id, result.sessionID)
-    if (result.timedOut || result.aborted || result.exitCode !== 0) {
+    let lastFailure: string | null = null
+    for (let retry = 0; retry <= reviewerStepRetries; retry += 1) {
+      const result = await options.step({
+        cwd: options.cwd,
+        prompt: reviewerPrompt(promptContext, task, attempt, workerOutput, options.customPrompt),
+        timeoutSeconds: options.reviewerTimeoutSeconds,
+        agent: options.reviewerAgent,
+        model: options.reviewerModel,
+        title: `Chainlink ${task.id} reviewer ${attempt}`,
+        signal: options.signal,
+      })
+      // Record the phase move even when the step yielded no session ID; a
+      // reviewer that failed to start has none, and without "reviewer" the
+      // recordChainlinkReview below would die on a phase mismatch.
+      await recordChainlinkReviewerStarted(workflow.id, result.sessionID)
+      if (!result.timedOut && !result.aborted && result.exitCode === 0) {
+        return extractReview(result.text || "The reviewer returned no report.")
+      }
       const reason = result.timedOut
         ? `timed out after ${options.reviewerTimeoutSeconds}s`
         : result.aborted
@@ -322,11 +343,14 @@ export async function runProcessInnerLoop(
             : `exited with code ${result.exitCode}`
       const stderr = result.stderr.trim()
       const message = `Chainlink reviewer ${attempt} for task ${task.id} ${reason} after ${result.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`
-      log(message)
-      await failChainlinkWorkflow(workflow.id, message).catch(() => null)
-      throw new Error(message)
+      lastFailure = message
+      const willRetry = !result.aborted && retry < reviewerStepRetries
+      log(willRetry ? `${message}; retrying reviewer (${retry + 1}/${reviewerStepRetries})` : message)
+      if (!willRetry) break
     }
-    return extractReview(result.text || "The reviewer returned no report.")
+    const message = lastFailure ?? `Chainlink reviewer ${attempt} for task ${task.id} failed to start`
+    await failChainlinkWorkflow(workflow.id, message).catch(() => null)
+    throw new Error(message)
   }
 
   // Someone may already have done this task. Review before adding to it.

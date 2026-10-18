@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Add the TUI sidebar/palette for the loop plugin (cli.json) (#2)
 
 ### Fixed
+- Retry a crashed reviewer step instead of failing the whole run; a transient reviewer exit no longer abandons the rest of the queue (#8)
 - Fix chainlink-loop dying with `is in phase worker` when a reviewer step returns no session ID, and log a failed step's exit code, stderr and duration (#6)
 - Fix the chainlink-loop CLI silently dropping inner-loop progress lines (#5)
 - Fix extractReview discarding genuine reviewer approvals when prose with brackets precedes the JSON verdict (#4)

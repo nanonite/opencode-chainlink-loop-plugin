@@ -47,6 +47,8 @@ export type ChainlinkCliArguments = {
   reviewerAgent: string
   workerTimeout: number
   reviewerTimeout: number
+  /** Extra reviewer processes to start after one dies before delivering a verdict. */
+  reviewerRetries: number
   customPrompt: string | null
   dryRun: boolean
   version: boolean
@@ -75,6 +77,10 @@ Options:
   --reviewer-agent <a> Agent for the reviewer (default plan; plan cannot edit files).
   --worker-timeout <s>   Per-step worker timeout in seconds (default 3600).
   --reviewer-timeout <s> Per-step reviewer timeout in seconds (default 1800).
+  --reviewer-retries <n> Extra reviewer processes to start when a reviewer step
+                      dies before delivering a verdict (non-zero exit, spawn
+                      error, timeout). A crash is retried, not treated as a
+                      verdict; an operator abort is never retried. Default 1.
   --prompt <text>     Operator direction layered above each task's notes; both
                       the worker and the reviewer follow it. Quote multi-word
                       values, e.g. --prompt "prefer the existing parser".
@@ -104,6 +110,7 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
     reviewerAgent: process.env.CHAINLINK_REVIEWER_AGENT ?? "plan",
     workerTimeout: Number(process.env.CHAINLINK_WORKER_TIMEOUT ?? 3600),
     reviewerTimeout: Number(process.env.CHAINLINK_REVIEWER_TIMEOUT ?? 1800),
+    reviewerRetries: Number(process.env.CHAINLINK_REVIEWER_RETRIES ?? 1),
     customPrompt: process.env.CHAINLINK_PROMPT ?? null,
     dryRun: false,
     version: false,
@@ -174,6 +181,9 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
       case "--reviewer-timeout":
         parsed.reviewerTimeout = Number(next())
         break
+      case "--reviewer-retries":
+        parsed.reviewerRetries = Number(next())
+        break
       case "--prompt":
         parsed.customPrompt = next()
         break
@@ -188,6 +198,9 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
   if (!Number.isFinite(parsed.workerTimeout) || parsed.workerTimeout < 1) throw new Error("--worker-timeout must be positive")
   if (!Number.isFinite(parsed.reviewerTimeout) || parsed.reviewerTimeout < 1) {
     throw new Error("--reviewer-timeout must be positive")
+  }
+  if (!Number.isInteger(parsed.reviewerRetries) || parsed.reviewerRetries < 0) {
+    throw new Error("--reviewer-retries must be a non-negative whole number")
   }
   if (!["auto", "always", "never"].includes(parsed.reviewFirst)) {
     throw new Error("--review-first must be auto, always or never")
@@ -223,6 +236,7 @@ export function buildProcessLoopOptions(input: BuildProcessLoopOptionsInput): Pr
     reviewerModel: parseModelRef(input.parsed.reviewerModel),
     workerTimeoutSeconds: input.parsed.workerTimeout,
     reviewerTimeoutSeconds: input.parsed.reviewerTimeout,
+    reviewerStepRetries: input.parsed.reviewerRetries,
     closeOnApproval: input.parsed.closeOnApproval,
     reviewFirst: input.parsed.reviewFirst,
     excludeIDs: input.parsed.excludeIDs,
