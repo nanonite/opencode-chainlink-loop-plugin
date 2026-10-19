@@ -967,11 +967,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           },
           worker_model: {
             type: "string",
-            description: "Optional worker model reference in provider/model form.",
+            description: "Optional worker model reference in provider/model or provider/model#variant form.",
           },
           reviewer_model: {
             type: "string",
-            description: "Optional reviewer model reference in provider/model form.",
+            description: "Optional reviewer model reference in provider/model or provider/model#variant form.",
           },
           custom_prompt: {
             type: "string",

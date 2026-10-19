@@ -82,7 +82,10 @@ export function opencodeRunArgs(input: ProcessStepInput): string[] {
   if (input.auto !== false) args.push("--auto")
   args.push("--format", "json")
   if (input.agent) args.push("--agent", input.agent)
-  if (input.model) args.push("--model", `${input.model.providerID}/${input.model.id}`)
+  if (input.model) {
+    const variant = input.model.variant ? `#${input.model.variant}` : ""
+    args.push("--model", `${input.model.providerID}/${input.model.id}${variant}`)
+  }
   if (input.title) args.push("--title", input.title)
   if (input.sessionID) args.push("--session", input.sessionID)
   args.push(input.prompt)

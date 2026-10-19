@@ -442,6 +442,30 @@ function latestAssistantText(messages: readonly unknown[]) {
   return ""
 }
 
+/**
+ * The child's failure, when it produced no usable text. A model admission error
+ * (for example an unavailable model ref) fails the drain before any assistant
+ * text exists, and reporting "no report" hides the real cause.
+ */
+function latestAssistantError(messages: readonly unknown[]) {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    if (!isRecord(message) || message.type !== "assistant") continue
+    const error = message.error
+    if (error == null) continue
+    if (typeof error === "string") return error
+    if (isRecord(error)) {
+      for (const key of ["message", "reason", "type", "name"]) {
+        const value = error[key]
+        if (typeof value === "string" && value.trim()) return value
+      }
+      return JSON.stringify(error)
+    }
+    return String(error)
+  }
+  return ""
+}
+
 function assertNotAborted(signal: AbortSignal | undefined) {
   if (signal?.aborted) throw new Error("Chainlink orchestration cancelled")
 }
@@ -559,7 +583,15 @@ async function completeChildTurn(
     try {
       await waitForSession(context, sessionID, options)
       options.registry?.clearPending(sessionID)
-      return latestAssistantText(await context.session.context({ sessionID }))
+      const messages = await context.session.context({ sessionID })
+      const text = latestAssistantText(messages)
+      if (text) return text
+      // No text plus an assistant error means the turn failed before it could
+      // report (for example a model admission error). Surface that cause instead
+      // of letting the caller report "returned no report".
+      const failure = latestAssistantError(messages)
+      if (failure) throw new Error(`Chainlink child session ${sessionID} failed: ${truncate(failure)}`)
+      return ""
     } catch (error) {
       if (error instanceof SessionStalledError && options.stallRetryPrompt && !retried) {
         retried = true
@@ -578,9 +610,20 @@ async function completeChildTurn(
 
 export function parseModelRef(value: string | null | undefined): ChainlinkModelRef | null {
   if (typeof value !== "string" || !value.trim()) return null
-  const parts = value.trim().split("/")
-  if (parts.length < 2 || !parts[0] || !parts[1]) throw new Error(`invalid model reference "${value}"; use provider/model`)
-  return { providerID: parts[0]!, id: parts.slice(1).join("/") }
+  // Both surfaces accept `provider/model#variant` (for example an effort level),
+  // but they want it in different places: `opencode run --model` takes the whole
+  // string, while the in-server API wants Model.Ref.variant on its own. Split it
+  // once here so the two paths cannot disagree.
+  const trimmed = value.trim()
+  const hash = trimmed.lastIndexOf("#")
+  const model = hash > 0 ? trimmed.slice(0, hash) : trimmed
+  const variant = hash > 0 ? trimmed.slice(hash + 1).trim() : ""
+  if (hash > 0 && !variant) throw new Error(`invalid model reference "${value}"; the "#" variant is empty`)
+  const parts = model.split("/")
+  if (parts.length < 2 || !parts[0] || !parts[1]) {
+    throw new Error(`invalid model reference "${value}"; use provider/model or provider/model#variant`)
+  }
+  return { providerID: parts[0]!, id: parts.slice(1).join("/"), ...(variant ? { variant } : {}) }
 }
 
 function childLocation(location: Location) {

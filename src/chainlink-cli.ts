@@ -75,8 +75,8 @@ Options:
                       enter. Needed when a project deliberately holds a subtree
                       back: \`issue next\` honours that, but the fallback used to
                       step past an exhausted task does not.
-  --worker-model <m>  provider/model for the worker.
-  --reviewer-model <m> provider/model for the reviewer.
+  --worker-model <m>  provider/model[#variant] for the worker.
+  --reviewer-model <m> provider/model[#variant] for the reviewer.
   --worker-agent <a>  Agent for the worker (default build).
   --reviewer-agent <a> Agent for the reviewer (default plan; plan cannot edit files).
   --worker-timeout <s>   Per-step worker timeout in seconds (default 3600).

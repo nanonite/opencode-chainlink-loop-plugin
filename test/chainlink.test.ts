@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
-import { extractReview, feedbackPrompt, reviewerPrompt, workerPrompt, type ChainlinkTask } from "../src/chainlink"
+import { extractReview, feedbackPrompt, parseModelRef, reviewerPrompt, workerPrompt, type ChainlinkTask } from "../src/chainlink"
+import { opencodeRunArgs } from "../src/chainlink-process"
 import { parseChainlinkArguments } from "../src/prompts"
 import type { ChainlinkWorkflowSnapshot } from "../src/state"
 
@@ -171,4 +172,31 @@ test("extractReview does not approve when findings are present", () => {
     next_action: "add a test",
   })
   expect(extractReview(output).approved).toBe(false)
+})
+
+test("parseModelRef moves a #variant out of the model id (#9)", () => {
+  expect(parseModelRef("opencode-go/deepseek-v4.1-flash#high")).toEqual({
+    providerID: "opencode-go",
+    id: "deepseek-v4.1-flash",
+    variant: "high",
+  })
+})
+
+test("parseModelRef leaves the variant unset when there is none", () => {
+  expect(parseModelRef("opencode-go/deepseek-v4.1-flash")).toEqual({
+    providerID: "opencode-go",
+    id: "deepseek-v4.1-flash",
+  })
+})
+
+test("parseModelRef rejects an empty #variant", () => {
+  expect(() => parseModelRef("opencode-go/deepseek-v4.1-flash#")).toThrow(/variant is empty/)
+})
+
+test("opencodeRunArgs round-trips the #variant for the CLI path (#9)", () => {
+  const model = parseModelRef("opencode-go/deepseek-v4.1-flash#high")!
+  const args = opencodeRunArgs({ cwd: "/tmp", prompt: "p", timeoutSeconds: 60, model })
+  const index = args.indexOf("--model")
+  expect(index).toBeGreaterThan(-1)
+  expect(args[index + 1]).toBe("opencode-go/deepseek-v4.1-flash#high")
 })

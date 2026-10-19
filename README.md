@@ -137,7 +137,7 @@ bun run src/chainlink-cli.ts --task 67 --dry-run
 | `--review-first auto\|always\|never` | Review work that already exists before dispatching a fresh worker (default `auto`). |
 | `--exclude <ids>` | Skip these issue subtrees when selecting ready tasks after an exhausted issue. |
 | `--prompt <text>` | Operator direction layered above each task's notes. Both the worker and the reviewer follow it, so a run can be scoped without editing the issues. Also settable via `CHAINLINK_PROMPT`; `--prompt` wins. |
-| `--worker-model` / `--reviewer-model` | `provider/model` per role. |
+| `--worker-model` / `--reviewer-model` | `provider/model[#variant]` per role. The variant (for example an effort level) is passed through to both surfaces. |
 | `--worker-agent` / `--reviewer-agent` | Defaults: `build` and `plan`. |
 | `--worker-timeout` / `--reviewer-timeout` | Per-step wall clock limit in seconds. |
 | `--startup-timeout <s>` | Kill a step that emits no output within this many seconds and retry it (default 300; 0 disables). Guards against a step whose `opencode run` never creates a session and would otherwise sit until its full per-step timeout. |
@@ -332,8 +332,8 @@ Defaults:
 - `chainlink_child_permissions`: `allow`; how the plugin answers permission requests from its own child sessions. `allow`/`inherit` answer inline, `deny` refuses, `ask` leaves them pending (the old blocking behaviour, for debugging only). A child session has no client attached, so anything left pending is indistinguishable from a hang.
 - `chainlink_close_completed_tasks`: `true`; approved tasks are closed by the plugin, never by the worker. `--no-close` overrides this per run.
 - `chainlink_db_path`: optional Chainlink database path; when unset, `CHAINLINK_DB` is inherited from the environment.
-- `chainlink_worker_model`: optional `provider/model` reference for worker child sessions.
-- `chainlink_reviewer_model`: optional `provider/model` reference for reviewer child sessions.
+- `chainlink_worker_model`: optional `provider/model[#variant]` reference for worker child sessions.
+- `chainlink_reviewer_model`: optional `provider/model[#variant]` reference for reviewer child sessions.
 
 ## State
 
