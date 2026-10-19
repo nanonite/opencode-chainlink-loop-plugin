@@ -158,13 +158,15 @@ The loop per task:
 
 **Exhausted tasks are skipped, not fatal.** A task that burns its attempt limit is left open for a human and the loop moves on to the next ready leaf. Because `issue next` keeps returning the same still-open task, the loop falls back to `issue ready --json` and picks the first leaf it has not touched. That fallback does **not** know about a project which deliberately holds a subtree back, so use `--exclude <ids>` for those — for example `--exclude 1` to keep the queue out of a "upstream reports" epic whose children wait on a human.
 
-### `/chainlink` and the `run_chainlink_outer` tool (in-server)
+### `/chainlink` and the `run_chainlink_outer` tool (deprecated, unsupported)
 
-The V2 plugin also registers a `/chainlink` command and a `run_chainlink_outer` tool that run the same loop using in-server child sessions.
+> **Deprecated.** This plugin supports exactly one Chainlink engine: the `chainlink-loop` CLI. The in-server child-session implementation described here predates the workspace rule in `AGENTS.md`; it is not supported, not extended, and will be removed. Use `chainlink-loop` for every Chainlink run.
 
-> **Known limitation (OpenCode 2.0.16).** The command handler is registered but its `execute` callback is never invoked by this build, so the model receives the raw text `/chainlink` instead of the instruction template. Anything typed after it is then interpreted by the model, not by the adapter. Use `chainlink-loop` for unattended work; the tool path remains for calling the loop from inside a session.
+The V2 plugin still registers a `/chainlink` command and a `run_chainlink_outer` tool that run the loop using in-server child sessions.
 
-What the tool path does enforce:
+> **Known limitation (OpenCode 2.0.16).** The command handler is registered but its `execute` callback is never invoked by this build, so the model receives the raw text `/chainlink` instead of the instruction template. Anything typed after it is then interpreted by the model, not by the adapter.
+
+For reference only, the deprecated tool path enforces:
 
 - Task ids are normalised, so `#67`, `67` and `issue 67` are the same task.
 - A `custom_prompt` (set from `/chainlink --prompt "..."`) is layered above every task's notes. The worker follows it alongside the requirements and the reviewer holds the work to it, so you can scope a run without editing the issues.

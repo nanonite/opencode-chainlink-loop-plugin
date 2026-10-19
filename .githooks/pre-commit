@@ -1,0 +1,5 @@
+#!/bin/sh
+# Enforces AGENTS.md -> Chainlink Engine Rule.
+# Enable once per clone: git config core.hooksPath .githooks
+set -e
+exec bun run check:engine

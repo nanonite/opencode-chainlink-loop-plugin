@@ -71,3 +71,13 @@ The smoke test should show `create_loop` (and possibly `stop_loop`) tool calls. 
 To test the CLI/TUI entrypoint locally, add the same checkout directory to the global `~/.config/opencode/cli.json` `plugins` list and open the TUI (`opencode2 --standalone`). Confirm the debug log shows `entrypoint=.../tui.tsx` and `stage=setup plugin=local.loop-mode.tui` for `role=cli`, the sidebar renders active loops, and `Ctrl+L` opens the loop-actions dialog. OpenCode 2.0.16 does not auto-load a directory plugin's TUI component from the server plugin list, so `cli.json` must list the checkout directory explicitly.
 
 OpenCode 2 loads a configured plugin directory through an `index.js`/`index.ts` entrypoint for the server and a `tui.tsx`/`tui.ts` entrypoint for the CLI, so keep the repository-root `index.js` and `tui.tsx` in place. Configured file paths are rejected and Git specifiers for packages with build scripts fail on OpenCode 2.0.16 (upstream opencode issues 49704 and 46551).
+
+## Chainlink Engine Rule
+
+This plugin supports **exactly one** Chainlink engine: the standalone `chainlink-loop` CLI (`src/chainlink-cli.ts` + `src/chainlink-process.ts`), which drives every step as a one-shot `opencode run` process. There is no LLM in the control path. Do not add a second engine, and do not add MCP support.
+
+**MCP is not supported.** This plugin is an in-process OpenCode plugin plus a CLI. Do not add `mcp.servers` entries, `@modelcontextprotocol/*` dependencies, or an MCP transport. MCP is a separate integration channel for external servers, not a plugin entrypoint.
+
+**The in-server child-session engine is not supported.** Do not add, extend, or fix `runChainlinkOuter`, `runInnerWorkflow`, `promptChild`, `ChainlinkChildRegistry`, `context.session.create(...)` orchestration, the `/chainlink` command, or the `run_chainlink_outer` tool. That implementation predates this rule and is deprecated: do not dispatch work to it, do not add features to it (retries, watchdogs, model variants, logging), and do not write new tests for it. If an in-session entrypoint is ever needed, it must be a thin launcher for the CLI engine — spawn `chainlink-loop` or call `runProcessLoop` and stream its log — never a second orchestrator.
+
+Enforcement: `bun run check:engine` inspects staged changes under `src/` and `test/` and rejects commits that add the forbidden surfaces. It is wired as the versioned `.githooks/pre-commit` hook; enable it once per clone with `git config core.hooksPath .githooks`. The guard is diff-based so the grandfathered code does not block unrelated commits. Use `git commit --no-verify` only for a deliberate removal or refactor of the deprecated engine.
