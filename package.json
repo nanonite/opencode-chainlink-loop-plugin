@@ -1,6 +1,6 @@
 {
   "name": "@prevalentware/opencode-loop-plugin",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "OpenCode loop plugin that adds Claude Code-style /loop recurring prompts: a persistent scheduler that re-injects an instruction into a session on an interval while it is idle.",
   "keywords": [
     "opencode",
