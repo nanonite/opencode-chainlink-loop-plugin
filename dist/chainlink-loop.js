@@ -4,7 +4,7 @@
 // src/chainlink-process.ts
 import { spawn } from "child_process";
 
-// src/chainlink.ts
+// src/chainlink-core.ts
 import { execFile } from "child_process";
 
 // src/state.ts
@@ -345,7 +345,7 @@ async function failChainlinkWorkflow(workflowID, error) {
   });
 }
 
-// src/chainlink.ts
+// src/chainlink-core.ts
 function normalizeTaskIds(raw) {
   if (raw == null)
     return null;
@@ -373,7 +373,6 @@ var execChainlinkCommand = (args, cwd, dbPath) => new Promise((resolve, reject) 
     resolve({ stdout, stderr });
   });
 });
-var EDIT_PERMISSION_TYPES = new Set(["edit", "write", "patch", "apply"]);
 function isRecord(value) {
   return typeof value === "object" && value !== null;
 }
@@ -1139,12 +1138,12 @@ var PLUGIN_NAME = "@prevalentware/opencode-loop-plugin";
 function readString(value) {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
-var injectedVersion = readString("0.2.3");
+var injectedVersion = readString("0.3.0");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-37-gc61d656"),
-  gitSha: readString("c61d656"),
+  gitDescribe: readString("v0.1.8-41-g027e966"),
+  gitSha: readString("027e966"),
   gitDirty: false,
   source: injectedVersion ? "build" : "dev"
 };
