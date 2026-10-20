@@ -9,7 +9,7 @@ import {
   type ProcessRunner,
   type ProcessStepInput,
 } from "./chainlink-process"
-import { execChainlinkCommand, parseModelRef, type ChainlinkCommandRunner } from "./chainlink"
+import { execChainlinkCommand, parseModelRef, type ChainlinkCommandRunner } from "./chainlink-core"
 import { acquireLoopLock, type LoopLock } from "./chainlink-lock"
 import { PLUGIN_NAME, formatBuildInfo } from "./version"
 

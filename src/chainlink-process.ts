@@ -18,7 +18,7 @@ import {
   type ChainlinkReview,
   type ChainlinkTask,
   type ChainlinkWorkflowOptions,
-} from "./chainlink"
+} from "./chainlink-core"
 import {
   createChainlinkWorkflow,
   failChainlinkWorkflow,

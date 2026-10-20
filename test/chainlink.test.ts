@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test"
-import { extractReview, feedbackPrompt, parseModelRef, reviewerPrompt, workerPrompt, type ChainlinkTask } from "../src/chainlink"
+import { extractReview, feedbackPrompt, parseModelRef, reviewerPrompt, workerPrompt, type ChainlinkTask } from "../src/chainlink-core"
 import { opencodeRunArgs } from "../src/chainlink-process"
-import { parseChainlinkArguments } from "../src/prompts"
 import type { ChainlinkWorkflowSnapshot } from "../src/state"
 
 function workflow(overrides: Partial<ChainlinkWorkflowSnapshot> = {}): ChainlinkWorkflowSnapshot {
@@ -31,34 +30,6 @@ function workflow(overrides: Partial<ChainlinkWorkflowSnapshot> = {}): Chainlink
 }
 
 const task: ChainlinkTask = { id: "67", title: "Add parser" }
-
-test("parseChainlinkArguments reads a quoted --prompt alongside task ids", () => {
-  const parsed = parseChainlinkArguments('#67 --attempts 5 --prompt "reuse the existing parser"', 20)
-  expect(parsed.task_ids).toEqual(["67"])
-  expect(parsed.max_attempts).toBe(5)
-  expect(parsed.custom_prompt).toBe("reuse the existing parser")
-})
-
-test("parseChainlinkArguments accepts single quotes and a prompt before the task", () => {
-  const parsed = parseChainlinkArguments("--prompt 'prefer tests first' 67", 20)
-  expect(parsed.task_ids).toEqual(["67"])
-  expect(parsed.custom_prompt).toBe("prefer tests first")
-})
-
-test("parseChainlinkArguments defaults custom_prompt to null", () => {
-  const parsed = parseChainlinkArguments("#1", 20)
-  expect(parsed.custom_prompt).toBeNull()
-  expect(parsed.close_on_approval).toBe(true)
-})
-
-test("parseChainlinkArguments rejects a missing or empty --prompt", () => {
-  expect(() => parseChainlinkArguments("#1 --prompt", 20)).toThrow("--prompt requires a direction string")
-  expect(() => parseChainlinkArguments('#1 --prompt ""', 20)).toThrow("--prompt requires a direction string")
-})
-
-test("parseChainlinkArguments names --prompt in the unrecognized-argument error", () => {
-  expect(() => parseChainlinkArguments("--bogus", 20)).toThrow("--prompt")
-})
 
 test("worker prompt layers the operator direction above the task notes", () => {
   const prompt = workerPrompt(workflow(), task, 1, undefined, "keep changes minimal")

@@ -2,7 +2,7 @@
 
 This context defines the language for loop-mode behavior across OpenCode surfaces. It exists to keep the scheduler, the slash command, and UI expectations distinct.
 
-Chainlink integration also provides issue-driven worker/reviewer workflows. Its standalone `chainlink-loop` CLI controls the workflow in code and runs each step through `opencode run`; this is the only supported engine. The OpenCode 2 `/chainlink` command and `run_chainlink_outer` tool use in-server child sessions and are deprecated (see AGENTS.md -> Chainlink Engine Rule).
+Chainlink integration also provides issue-driven worker/reviewer workflows. Its standalone `chainlink-loop` CLI controls the workflow in code and runs each step through `opencode run`; this is the only supported engine and entrypoint. The former in-server `/chainlink` command and `run_chainlink_outer` tool were removed (see AGENTS.md -> Chainlink Engine Rule).
 
 ## Language
 
@@ -41,7 +41,7 @@ _Avoid_: system prompt, override
 - A **Loop** is executed as a series of **Iterations** driven by the **Scheduler**.
 - A **Dynamic Loop** delegates pacing to the agent one **Iteration** at a time; an **Interval Loop** never does.
 - The `/loop` slash command is the user entrypoint; the loop tools are the agent entrypoint; both mutate the same persisted state owned by the server plugin.
-- `chainlink-loop` is the standalone and only supported entrypoint for a **Chainlink Outer Loop**. On OpenCode 2, `/chainlink` and `run_chainlink_outer` are a deprecated in-server entrypoint (see AGENTS.md).
+- `chainlink-loop` is the standalone and only entrypoint for a **Chainlink Outer Loop**; the former in-server `/chainlink` command and `run_chainlink_outer` tool were removed (see AGENTS.md).
 - A **Chainlink Outer Loop** runs one **Chainlink Workflow** per selected issue. Each workflow uses worker and reviewer attempts, rather than scheduler iterations.
 - An **Operator Direction** applies to every **Chainlink Workflow** in a run, so the worker scopes to it and the reviewer verifies it.
 

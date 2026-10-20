@@ -1,17 +1,14 @@
 // Enforces the workspace rule in AGENTS.md: this plugin supports exactly one
 // Chainlink engine, the standalone `chainlink-loop` CLI over one-shot
-// `opencode run` processes. A commit may not add another engine (in-server
-// child sessions) or MCP support.
-//
-// The check is diff-based: it inspects only lines added to `src/` or `test/`, so
-// the grandfathered in-server implementation that predates the rule does not
-// block unrelated commits. Once that implementation is removed, this can become
-// a full-tree scan.
+// `opencode run` processes. A second engine (in-server child sessions) and MCP
+// support are not allowed anywhere in `src/` or `test/`.
 //
 // Wired as `.githooks/pre-commit` via `git config core.hooksPath .githooks`.
-// Bypass with `git commit --no-verify` only for a deliberate removal/refactor.
+// Bypass with `git commit --no-verify` only for a deliberate refactor that
+// temporarily needs one of the forbidden identifiers.
 
 import { execFileSync } from "node:child_process"
+import { readFileSync } from "node:fs"
 
 type Forbidden = {
   pattern: RegExp
@@ -31,30 +28,20 @@ const FORBIDDEN: Forbidden[] = [
   { pattern: /\bmcp\.servers\b/, why: "MCP support" },
 ]
 
-const SCANNED = /^(src|test)\//
-const IGNORED = /^dist\//
+const ROOTS = ["src", "test"]
 
-function stagedDiff(): string {
-  try {
-    return execFileSync("git", ["diff", "--cached", "--unified=0", "--no-color"], { encoding: "utf8" })
-  } catch {
-    return ""
-  }
-}
+const files = execFileSync("git", ["ls-files", "--", ...ROOTS], { encoding: "utf8" })
+  .split("\n")
+  .filter(Boolean)
 
-const violations: Array<{ file: string; line: string; why: string }> = []
-let file = ""
-
-for (const raw of stagedDiff().split("\n")) {
-  if (raw.startsWith("+++ ")) {
-    file = raw.slice(4).replace(/^b\//, "")
-    continue
-  }
-  if (!raw.startsWith("+")) continue
-  if (!SCANNED.test(file) || IGNORED.test(file)) continue
-  const added = raw.slice(1)
-  for (const { pattern, why } of FORBIDDEN) {
-    if (pattern.test(added)) violations.push({ file, line: added.trim(), why })
+const violations: Array<{ file: string; number: number; line: string; why: string }> = []
+for (const file of files) {
+  const lines = readFileSync(file, "utf8").split("\n")
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!
+    for (const { pattern, why } of FORBIDDEN) {
+      if (pattern.test(line)) violations.push({ file, number: index + 1, line: line.trim(), why })
+    }
   }
 }
 
@@ -62,10 +49,10 @@ if (violations.length) {
   console.error("[check:engine] This repository supports exactly one Chainlink engine: the CLI.")
   console.error("[check:engine] See AGENTS.md -> Chainlink Engine Rule.\n")
   for (const violation of violations) {
-    console.error(`  ${violation.file}: ${violation.line}`)
+    console.error(`  ${violation.file}:${violation.number}: ${violation.line}`)
     console.error(`    -> ${violation.why}`)
   }
-  console.error("\nUse `git commit --no-verify` only for a deliberate removal/refactor of the deprecated engine.")
+  console.error("\nUse `git commit --no-verify` only for a deliberate refactor.")
   process.exit(1)
 }
 

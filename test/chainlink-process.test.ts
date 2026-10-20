@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { buildProcessLoopOptions, type ChainlinkCliArguments } from "../src/chainlink-cli"
 import { reviewLogLine, runProcessInnerLoop, runStepProcess, type ProcessLoopOptions, type ProcessStepResult } from "../src/chainlink-process"
-import { extractReview, REVIEW_PARSE_FAILURE, type ChainlinkReview, type ChainlinkTask } from "../src/chainlink"
+import { extractReview, REVIEW_PARSE_FAILURE, type ChainlinkReview, type ChainlinkTask } from "../src/chainlink-core"
 import { createChainlinkWorkflow, getChainlinkWorkflow } from "../src/state"
 
 function review(overrides: Partial<ChainlinkReview> = {}): ChainlinkReview {

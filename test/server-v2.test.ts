@@ -11,7 +11,6 @@ const TOOL_NAMES = [
   "list_loops",
   "pause_loop",
   "resume_loop",
-  "run_chainlink_outer",
   "run_loop",
   "schedule_next_run",
   "stop_loop",
