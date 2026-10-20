@@ -537,10 +537,17 @@ function extractReview(output) {
 function parseModelRef(value) {
   if (typeof value !== "string" || !value.trim())
     return null;
-  const parts = value.trim().split("/");
-  if (parts.length < 2 || !parts[0] || !parts[1])
-    throw new Error(`invalid model reference "${value}"; use provider/model`);
-  return { providerID: parts[0], id: parts.slice(1).join("/") };
+  const trimmed = value.trim();
+  const hash = trimmed.lastIndexOf("#");
+  const model = hash > 0 ? trimmed.slice(0, hash) : trimmed;
+  const variant = hash > 0 ? trimmed.slice(hash + 1).trim() : "";
+  if (hash > 0 && !variant)
+    throw new Error(`invalid model reference "${value}"; the "#" variant is empty`);
+  const parts = model.split("/");
+  if (parts.length < 2 || !parts[0] || !parts[1]) {
+    throw new Error(`invalid model reference "${value}"; use provider/model or provider/model#variant`);
+  }
+  return { providerID: parts[0], id: parts.slice(1).join("/"), ...variant ? { variant } : {} };
 }
 function directionBlock(customPrompt, role) {
   const direction = customPrompt?.trim();
@@ -686,8 +693,10 @@ function opencodeRunArgs(input) {
   args.push("--format", "json");
   if (input.agent)
     args.push("--agent", input.agent);
-  if (input.model)
-    args.push("--model", `${input.model.providerID}/${input.model.id}`);
+  if (input.model) {
+    const variant = input.model.variant ? `#${input.model.variant}` : "";
+    args.push("--model", `${input.model.providerID}/${input.model.id}${variant}`);
+  }
   if (input.title)
     args.push("--title", input.title);
   if (input.sessionID)
@@ -1130,12 +1139,12 @@ var PLUGIN_NAME = "@prevalentware/opencode-loop-plugin";
 function readString(value) {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
-var injectedVersion = readString("0.2.2");
+var injectedVersion = readString("0.2.3");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-30-ga8f166b"),
-  gitSha: readString("a8f166b"),
+  gitDescribe: readString("v0.1.8-37-gc61d656"),
+  gitSha: readString("c61d656"),
   gitDirty: false,
   source: injectedVersion ? "build" : "dev"
 };
@@ -1173,8 +1182,8 @@ Options:
                       enter. Needed when a project deliberately holds a subtree
                       back: \`issue next\` honours that, but the fallback used to
                       step past an exhausted task does not.
-  --worker-model <m>  provider/model for the worker.
-  --reviewer-model <m> provider/model for the reviewer.
+  --worker-model <m>  provider/model[#variant] for the worker.
+  --reviewer-model <m> provider/model[#variant] for the reviewer.
   --worker-agent <a>  Agent for the worker (default build).
   --reviewer-agent <a> Agent for the reviewer (default plan; plan cannot edit files).
   --worker-timeout <s>   Per-step worker timeout in seconds (default 3600).

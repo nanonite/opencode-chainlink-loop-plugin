@@ -988,6 +988,28 @@ function latestAssistantText(messages) {
   }
   return "";
 }
+function latestAssistantError(messages) {
+  for (let messageIndex = messages.length - 1;messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex];
+    if (!isRecord(message) || message.type !== "assistant")
+      continue;
+    const error = message.error;
+    if (error == null)
+      continue;
+    if (typeof error === "string")
+      return error;
+    if (isRecord(error)) {
+      for (const key of ["message", "reason", "type", "name"]) {
+        const value = error[key];
+        if (typeof value === "string" && value.trim())
+          return value;
+      }
+      return JSON.stringify(error);
+    }
+    return String(error);
+  }
+  return "";
+}
 function assertNotAborted(signal) {
   if (signal?.aborted)
     throw new Error("Chainlink orchestration cancelled");
@@ -1079,7 +1101,14 @@ async function completeChildTurn(context, sessionID, options) {
     try {
       await waitForSession(context, sessionID, options);
       options.registry?.clearPending(sessionID);
-      return latestAssistantText(await context.session.context({ sessionID }));
+      const messages = await context.session.context({ sessionID });
+      const text = latestAssistantText(messages);
+      if (text)
+        return text;
+      const failure = latestAssistantError(messages);
+      if (failure)
+        throw new Error(`Chainlink child session ${sessionID} failed: ${truncate(failure)}`);
+      return "";
     } catch (error) {
       if (error instanceof SessionStalledError && options.stallRetryPrompt && !retried) {
         retried = true;
@@ -1098,10 +1127,17 @@ async function completeChildTurn(context, sessionID, options) {
 function parseModelRef(value) {
   if (typeof value !== "string" || !value.trim())
     return null;
-  const parts = value.trim().split("/");
-  if (parts.length < 2 || !parts[0] || !parts[1])
-    throw new Error(`invalid model reference "${value}"; use provider/model`);
-  return { providerID: parts[0], id: parts.slice(1).join("/") };
+  const trimmed = value.trim();
+  const hash = trimmed.lastIndexOf("#");
+  const model = hash > 0 ? trimmed.slice(0, hash) : trimmed;
+  const variant = hash > 0 ? trimmed.slice(hash + 1).trim() : "";
+  if (hash > 0 && !variant)
+    throw new Error(`invalid model reference "${value}"; the "#" variant is empty`);
+  const parts = model.split("/");
+  if (parts.length < 2 || !parts[0] || !parts[1]) {
+    throw new Error(`invalid model reference "${value}"; use provider/model or provider/model#variant`);
+  }
+  return { providerID: parts[0], id: parts.slice(1).join("/"), ...variant ? { variant } : {} };
 }
 function childLocation(location) {
   return {
@@ -1610,12 +1646,12 @@ var PLUGIN_NAME = "@prevalentware/opencode-loop-plugin";
 function readString(value) {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
-var injectedVersion = readString("0.2.2");
+var injectedVersion = readString("0.2.3");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-30-ga8f166b"),
-  gitSha: readString("a8f166b"),
+  gitDescribe: readString("v0.1.8-37-gc61d656"),
+  gitSha: readString("c61d656"),
   gitDirty: false,
   source: injectedVersion ? "build" : "dev"
 };
@@ -2449,11 +2485,11 @@ Call run_chainlink_outer exactly once with exactly this JSON input.`,
         },
         worker_model: {
           type: "string",
-          description: "Optional worker model reference in provider/model form."
+          description: "Optional worker model reference in provider/model or provider/model#variant form."
         },
         reviewer_model: {
           type: "string",
-          description: "Optional reviewer model reference in provider/model form."
+          description: "Optional reviewer model reference in provider/model or provider/model#variant form."
         },
         custom_prompt: {
           type: "string",
