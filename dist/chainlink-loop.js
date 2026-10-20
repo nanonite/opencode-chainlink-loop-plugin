@@ -1138,12 +1138,12 @@ var PLUGIN_NAME = "@prevalentware/opencode-loop-plugin";
 function readString(value) {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
-var injectedVersion = readString("0.3.0");
+var injectedVersion = readString("0.3.1");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-41-g027e966"),
-  gitSha: readString("027e966"),
+  gitDescribe: readString("v0.1.8-45-g42dd1ca"),
+  gitSha: readString("42dd1ca"),
   gitDirty: false,
   source: injectedVersion ? "build" : "dev"
 };
@@ -1380,6 +1380,7 @@ ${USAGE}`);
   const ownerSessionID = `chainlink-cli-${process.pid}`;
   const log = (line) => process.stdout.write(`[chainlink] ${line}
 `);
+  log(`build: ${formatBuildInfo()}`);
   const step = async (input) => {
     const label = input.sessionID ? `resume ${input.sessionID}` : input.title ?? "step";
     log(`$ opencode run ${input.agent ?? ""} ${label}`);
@@ -1398,7 +1399,6 @@ ${USAGE}`);
     dbPath: process.env.CHAINLINK_DB ?? null
   });
   if (parsed.dryRun) {
-    log(`build: ${formatBuildInfo()}`);
     log(`cwd: ${cwd}`);
     log(`tasks: ${parsed.taskIds?.join(", ") ?? "(queue)"}`);
     log(`attempts: ${parsed.attempts}, close on approval: ${parsed.closeOnApproval}, review-first: ${parsed.reviewFirst}`);
