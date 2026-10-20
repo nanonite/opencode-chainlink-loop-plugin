@@ -297,6 +297,9 @@ export async function main(argv: string[]) {
   const cwd = process.cwd()
   const ownerSessionID = `chainlink-cli-${process.pid}`
   const log = (line: string) => process.stdout.write(`[chainlink] ${line}\n`)
+  // Every run names the build it is executing, so a detached log answers
+  // "which version is this?" without inspecting the process.
+  log(`build: ${formatBuildInfo()}`)
 
   const step: ProcessRunner = async (input: ProcessStepInput) => {
     const label = input.sessionID ? `resume ${input.sessionID}` : input.title ?? "step"
@@ -318,7 +321,6 @@ export async function main(argv: string[]) {
   })
 
   if (parsed.dryRun) {
-    log(`build: ${formatBuildInfo()}`)
     log(`cwd: ${cwd}`)
     log(`tasks: ${parsed.taskIds?.join(", ") ?? "(queue)"}`)
     log(`attempts: ${parsed.attempts}, close on approval: ${parsed.closeOnApproval}, review-first: ${parsed.reviewFirst}`)

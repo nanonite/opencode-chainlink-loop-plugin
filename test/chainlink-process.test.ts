@@ -2,7 +2,7 @@ import { expect, test, beforeEach, afterEach } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { buildProcessLoopOptions, type ChainlinkCliArguments } from "../src/chainlink-cli"
+import { buildProcessLoopOptions, main, type ChainlinkCliArguments } from "../src/chainlink-cli"
 import { reviewLogLine, runProcessInnerLoop, runStepProcess, type ProcessLoopOptions, type ProcessStepResult } from "../src/chainlink-process"
 import { extractReview, REVIEW_PARSE_FAILURE, type ChainlinkReview, type ChainlinkTask } from "../src/chainlink-core"
 import { createChainlinkWorkflow, getChainlinkWorkflow } from "../src/state"
@@ -63,6 +63,23 @@ test("buildProcessLoopOptions wires the logger through to the loop", () => {
   expect(options.taskIds).toEqual(["67"])
   expect(options.maxAttempts).toBe(5)
   expect(options.closeOnApproval).toBe(false)
+})
+
+test("every CLI run logs its build identity, including real runs (#10 follow-up)", async () => {
+  const writes: string[] = []
+  const original = process.stdout.write
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+  try {
+    // --dry-run returns before touching the lock or spawns anything, but it uses
+    // the same log() the real run does, which is where the stamp now lives.
+    expect(await main(["--dry-run"])).toBe(0)
+  } finally {
+    process.stdout.write = original
+  }
+  expect(writes.join("")).toContain("[chainlink] build: ")
 })
 
 let dir = ""
