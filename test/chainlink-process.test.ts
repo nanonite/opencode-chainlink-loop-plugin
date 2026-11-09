@@ -49,6 +49,7 @@ test("buildProcessLoopOptions wires the logger through to the loop", () => {
     reviewerRetries: 1,
     startupTimeout: 300,
     startupRetries: 1,
+    verifyCommand: null,
     customPrompt: null,
     dryRun: false,
     version: false,
@@ -64,6 +65,7 @@ test("buildProcessLoopOptions wires the logger through to the loop", () => {
   expect(options.taskIds).toEqual(["67"])
   expect(options.maxAttempts).toBe(5)
   expect(options.closeOnApproval).toBe(false)
+  expect(options.verifyCommand).toBeNull()
 })
 
 test("every CLI run logs its build identity, including real runs (#10 follow-up)", async () => {

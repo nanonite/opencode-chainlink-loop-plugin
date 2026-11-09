@@ -1365,8 +1365,8 @@ var injectedVersion = readString("0.3.1");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-47-gaef9dac"),
-  gitSha: readString("aef9dac"),
+  gitDescribe: readString("v0.1.8-48-gb49cb39"),
+  gitSha: readString("b49cb39"),
   gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
@@ -1764,6 +1764,9 @@ Options:
                       sit until its full per-step timeout.
   --startup-retries <n> Retries for a step that never produced any output at all
                       (default 1). The killed process group is logged.
+  --verify <cmd>      Acceptance command run in the worktree after reviewer
+                      approval. Exit 0 is required for a "done" outcome; a
+                      failure becomes findings for the next worker attempt.
   --prompt <text>     Operator direction layered above each task's notes; both
                       the worker and the reviewer follow it. Quote multi-word
                       values, e.g. --prompt "prefer the existing parser".
@@ -1792,6 +1795,7 @@ function parseArgs(argv) {
     reviewerRetries: Number(process.env.CHAINLINK_REVIEWER_RETRIES ?? 1),
     startupTimeout: Number(process.env.CHAINLINK_STARTUP_TIMEOUT ?? 300),
     startupRetries: Number(process.env.CHAINLINK_STARTUP_RETRIES ?? 1),
+    verifyCommand: null,
     customPrompt: process.env.CHAINLINK_PROMPT ?? null,
     dryRun: false,
     version: false,
@@ -1865,6 +1869,9 @@ function parseArgs(argv) {
       case "--startup-retries":
         parsed.startupRetries = Number(next());
         break;
+      case "--verify":
+        parsed.verifyCommand = next();
+        break;
       case "--prompt":
         parsed.customPrompt = next();
         break;
@@ -1915,6 +1922,8 @@ function buildProcessLoopOptions(input) {
     reviewerStepRetries: input.parsed.reviewerRetries,
     startupTimeoutSeconds: input.parsed.startupTimeout,
     startupRetries: input.parsed.startupRetries,
+    verifyCommand: input.parsed.verifyCommand,
+    verifyTimeoutSeconds: 600,
     closeOnApproval: input.parsed.closeOnApproval,
     reviewFirst: input.parsed.reviewFirst,
     excludeIDs: input.parsed.excludeIDs,
@@ -2268,7 +2277,8 @@ ${USAGE}`);
   if (report.error)
     log(`error: ${report.error}`);
   const status = report.status;
-  const exitCode = report.status === "failed" || report.status === "interrupted" || report.status === "exhausted" ? 1 : 0;
+  const allDone = Object.values(report.outcomes).every((outcome) => outcome === "done");
+  const exitCode = report.status === "failed" || report.status === "interrupted" || report.status === "exhausted" ? 1 : report.status === "idle" || allDone ? 0 : 1;
   await recorder.finish(status, exitCode);
   const final = runResultSummary(recorder.snapshot(), recorder.path);
   log(`RESULT ${JSON.stringify(final)}`);
