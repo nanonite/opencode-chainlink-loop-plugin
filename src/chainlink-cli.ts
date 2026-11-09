@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { spawn } from "node:child_process"
+import { mkdir, open } from "node:fs/promises"
 import {
   collectStepOutput,
   detectExistingWork,
@@ -13,8 +15,16 @@ import { execChainlinkCommand, parseModelRef, type ChainlinkCommandRunner } from
 import { acquireLoopLock, type LoopLock } from "./chainlink-lock"
 import {
   ChainlinkRunRecorder,
+  deriveRunState,
+  findRunRecord,
+  formatRunTable,
   generateRunID,
+  runExitCode,
+  runLogPath,
+  runRecordPath,
   runResultSummary,
+  runsDirectory,
+  type ChainlinkRunRecord,
   type ChainlinkRunStatus,
 } from "./chainlink-runs"
 import { PLUGIN_NAME, formatBuildInfo } from "./version"
@@ -289,7 +299,228 @@ export function buildProcessLoopOptions(input: BuildProcessLoopOptionsInput): Pr
   }
 }
 
+export type CliCommandContext = {
+  cwd?: string
+  dbPath?: string | null
+  stdout?: (line: string) => void
+  stderr?: (line: string) => void
+  pollMs?: number
+  isProcessAlive?: (pid: number) => boolean
+}
+
+function commandContext(context: CliCommandContext = {}) {
+  return {
+    cwd: context.cwd ?? process.cwd(),
+    dbPath: context.dbPath === undefined ? (process.env.CHAINLINK_DB ?? null) : context.dbPath,
+    stdout: context.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
+    stderr: context.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)),
+    pollMs: context.pollMs ?? 1000,
+    isProcessAlive: context.isProcessAlive,
+  }
+}
+
+function shellQuote(value: string) {
+  if (/^[A-Za-z0-9_./:=@%+,-]+$/.test(value)) return value
+  return `'${value.replaceAll("'", `'\\''`)}'`
+}
+
+/** The exact command that resumes a dead run without guessing a path or id. */
+export function relaunchCommand(record: ChainlinkRunRecord) {
+  const args: string[] = []
+  for (let index = 0; index < record.argv.length; index += 1) {
+    const arg = record.argv[index]!
+    if (arg === "--run-id") {
+      index += 1
+      continue
+    }
+    if (arg === "--review-first") {
+      index += 1
+      continue
+    }
+    args.push(arg)
+  }
+  args.push("--review-first", "always")
+  return ["chainlink-loop", ...args].map(shellQuote).join(" ")
+}
+
+function statusExitCode(state: string) {
+  return state === "running" || state === "done" || state === "idle" ? 0 : 1
+}
+
+export async function statusCommand(argv: string[], context: CliCommandContext = {}): Promise<number> {
+  const ctx = commandContext(context)
+  let runId: string | null = null
+  let json = false
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!
+    if (arg === "--json") {
+      json = true
+    } else if (arg === "--run") {
+      const value = argv[index + 1]
+      if (value == null) {
+        ctx.stderr("--run needs a value")
+        return 2
+      }
+      runId = value
+      index += 1
+    } else {
+      ctx.stderr(`unknown option ${arg}`)
+      return 2
+    }
+  }
+
+  const lookup = await findRunRecord({ runId, cwd: ctx.cwd, dbPath: ctx.dbPath })
+  if (!lookup) {
+    ctx.stderr(
+      runId
+        ? `no Chainlink run record found with id "${runId}"`
+        : `no Chainlink run record found for ${ctx.cwd} (CHAINLINK_DB=${ctx.dbPath ?? ""})`,
+    )
+    return 1
+  }
+  const derived = deriveRunState(lookup.record, { isProcessAlive: ctx.isProcessAlive })
+  const info = {
+    ...runResultSummary(lookup.record, lookup.path),
+    pid: lookup.record.pid,
+    heartbeatAt: lookup.record.heartbeatAt,
+    heartbeatAgeMs: derived.heartbeatAgeMs,
+    stale: derived.stale,
+    alive: derived.alive,
+    selection: lookup.selection,
+    candidates: lookup.candidates,
+    ...(derived.state === "dead" ? { relaunch: relaunchCommand(lookup.record) } : {}),
+  }
+  if (json) {
+    ctx.stdout(JSON.stringify(info))
+  } else {
+    ctx.stdout(`run: ${lookup.record.runId}`)
+    ctx.stdout(`record: ${lookup.path}`)
+    ctx.stdout(`state: ${derived.state}`)
+    if (lookup.selection === "newest") ctx.stdout(`selection: newest of ${lookup.candidates} run(s) for this workspace`)
+    ctx.stdout(`pid: ${lookup.record.pid} (${derived.alive ? "alive" : "not alive"})`)
+    ctx.stdout(
+      `heartbeat: ${lookup.record.heartbeatAt} (age ${Math.round(derived.heartbeatAgeMs / 1000)}s${derived.stale ? ", stale" : ""})`,
+    )
+    if (lookup.record.current) {
+      ctx.stdout(
+        `current: task ${lookup.record.current.taskID ?? "?"} attempt ${lookup.record.current.attempt ?? "?"} ${lookup.record.current.step ?? ""}`.trimEnd(),
+      )
+    }
+    for (const line of formatRunTable(lookup.record)) ctx.stdout(line)
+    if (derived.state === "dead") ctx.stdout(`relaunch: ${relaunchCommand(lookup.record)}`)
+  }
+  return statusExitCode(derived.state)
+}
+
+export async function waitCommand(argv: string[], context: CliCommandContext = {}): Promise<number> {
+  const ctx = commandContext(context)
+  let runId: string | null = null
+  let timeoutSeconds = 0
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!
+    if (arg === "--run") {
+      const value = argv[index + 1]
+      if (value == null) {
+        ctx.stderr("--run needs a value")
+        return 2
+      }
+      runId = value
+      index += 1
+    } else if (arg === "--timeout") {
+      const value = argv[index + 1]
+      if (value == null) {
+        ctx.stderr("--timeout needs a value")
+        return 2
+      }
+      timeoutSeconds = Number(value)
+      index += 1
+    } else {
+      ctx.stderr(`unknown option ${arg}`)
+      return 2
+    }
+  }
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) {
+    ctx.stderr("--timeout must be a non-negative number of seconds")
+    return 2
+  }
+  const deadline = timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : Number.POSITIVE_INFINITY
+  while (true) {
+    const lookup = await findRunRecord({ runId, cwd: ctx.cwd, dbPath: ctx.dbPath })
+    if (lookup) {
+      const derived = deriveRunState(lookup.record, { isProcessAlive: ctx.isProcessAlive })
+      if (derived.state !== "running") {
+        const result = { ...runResultSummary(lookup.record, lookup.path), wait: "finished" }
+        ctx.stdout(`[chainlink] RESULT ${JSON.stringify(result)}`)
+        return runExitCode(lookup.record)
+      }
+      if (Date.now() >= deadline) {
+        const result = { ...runResultSummary(lookup.record, lookup.path), wait: "timeout" }
+        ctx.stdout(`[chainlink] RESULT ${JSON.stringify(result)}`)
+        return 3
+      }
+    } else if (Date.now() >= deadline) {
+      ctx.stdout(`[chainlink] RESULT ${JSON.stringify({ wait: "timeout", error: "no run record found" })}`)
+      return 3
+    }
+    const remaining = deadline - Date.now()
+    const sleep = Number.isFinite(remaining) ? Math.max(1, Math.min(ctx.pollMs, remaining)) : ctx.pollMs
+    await new Promise((resolve) => setTimeout(resolve, sleep))
+  }
+}
+
+export async function startCommand(argv: string[], context: CliCommandContext = {}): Promise<number> {
+  const ctx = commandContext(context)
+  let detach = false
+  const childArgs: string[] = []
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!
+    if (arg === "--detach") {
+      detach = true
+      continue
+    }
+    if (arg === "--run-id") {
+      index += 1
+      continue
+    }
+    childArgs.push(arg)
+  }
+  if (!detach) {
+    ctx.stderr("start requires --detach")
+    return 2
+  }
+  const script = process.argv[1]
+  if (!script) {
+    ctx.stderr("cannot locate the chainlink-loop entrypoint for --detach")
+    return 2
+  }
+  const runId = generateRunID()
+  const logPath = runLogPath(runId)
+  const recordPath = runRecordPath(runId)
+  await mkdir(runsDirectory(), { recursive: true, mode: 0o700 })
+  const handle = await open(logPath, "a", 0o600)
+  let child
+  try {
+    child = spawn(process.execPath, [script, ...childArgs, "--run-id", runId], {
+      cwd: ctx.cwd,
+      env: process.env,
+      detached: true,
+      stdio: ["ignore", handle.fd, handle.fd],
+    })
+  } finally {
+    await handle.close()
+  }
+  child.unref()
+  ctx.stdout(`run: ${runId}`)
+  ctx.stdout(`log: ${logPath}`)
+  ctx.stdout(`record: ${recordPath}`)
+  return 0
+}
+
 export async function main(argv: string[]) {
+  if (argv[0] === "status") return statusCommand(argv.slice(1))
+  if (argv[0] === "wait") return waitCommand(argv.slice(1))
+  if (argv[0] === "start") return startCommand(argv.slice(1))
+
   let parsed: ChainlinkCliArguments
   try {
     parsed = parseArgs(argv)
