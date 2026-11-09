@@ -26,9 +26,13 @@ function defaultProcessAlive(pid: number) {
   }
 }
 
+/** The cwd+CHAINLINK_DB key shared by the loop lock and run-record lookups. */
+export function workspaceKey(cwd: string, dbPath: string | null): string {
+  return `${cwd}::${dbPath ?? ""}`.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(-120)
+}
+
 export function lockPathFor(cwd: string, dbPath: string | null): string {
-  const key = `${cwd}::${dbPath ?? ""}`.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(-120)
-  return join(tmpdir(), `chainlink-loop-${key}.lock`)
+  return join(tmpdir(), `chainlink-loop-${workspaceKey(cwd, dbPath)}.lock`)
 }
 
 export async function acquireLoopLock(

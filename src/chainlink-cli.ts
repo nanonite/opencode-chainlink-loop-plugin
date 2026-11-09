@@ -11,6 +11,12 @@ import {
 } from "./chainlink-process"
 import { execChainlinkCommand, parseModelRef, type ChainlinkCommandRunner } from "./chainlink-core"
 import { acquireLoopLock, type LoopLock } from "./chainlink-lock"
+import {
+  ChainlinkRunRecorder,
+  generateRunID,
+  runResultSummary,
+  type ChainlinkRunStatus,
+} from "./chainlink-runs"
 import { PLUGIN_NAME, formatBuildInfo } from "./version"
 
 function parseJSON(text: string): unknown {
@@ -57,6 +63,8 @@ export type ChainlinkCliArguments = {
   dryRun: boolean
   version: boolean
   help: boolean
+  /** Internal: lets `start --detach` name the record before spawning the child. */
+  runId: string | null
 }
 
 const USAGE = `chainlink-loop — deterministic Chainlink outer/inner loop (no LLM in the control path)
@@ -127,6 +135,7 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
     dryRun: false,
     version: false,
     help: false,
+    runId: null,
   }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!
@@ -207,6 +216,9 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
         break
       case "--dry-run":
         parsed.dryRun = true
+        break
+      case "--run-id":
+        parsed.runId = next()
         break
       default:
         throw new Error(`unknown option ${arg}`)
@@ -295,6 +307,7 @@ export async function main(argv: string[]) {
   }
 
   const cwd = process.cwd()
+  const dbPath = process.env.CHAINLINK_DB ?? null
   const ownerSessionID = `chainlink-cli-${process.pid}`
   const log = (line: string) => process.stdout.write(`[chainlink] ${line}\n`)
   // Every run names the build it is executing, so a detached log answers
@@ -317,7 +330,7 @@ export async function main(argv: string[]) {
     step,
     runner: execChainlinkCommand,
     log,
-    dbPath: process.env.CHAINLINK_DB ?? null,
+    dbPath,
   })
 
   if (parsed.dryRun) {
@@ -335,14 +348,51 @@ export async function main(argv: string[]) {
     return 0
   }
 
-  // SIGINT/SIGTERM must actually stop the loop. A handler that only logs leaves
-  // the process running, so a "killed" loop keeps dispatching workers.
+  const recorder = await ChainlinkRunRecorder.start({
+    runId: parsed.runId ?? generateRunID(),
+    cwd,
+    dbPath,
+    argv,
+    plannedTaskIds: parsed.taskIds ?? undefined,
+  })
+  log(`run: ${recorder.runId}`)
+  log(`record: ${recorder.path}`)
+  options.onRunEvent = async (event) => {
+    if (event.type === "task-started") {
+      await recorder.taskStarted(event.taskID, event.title, event.baseSha, event.maxAttempts)
+    } else if (event.type === "step") {
+      await recorder.step(event.taskID, event.attempt, event.step)
+    } else {
+      await recorder.taskOutcome(event.taskID, event.outcome, {
+        attempts: event.attempts,
+        verify: event.verify,
+        stopReason: event.stopReason,
+      })
+    }
+  }
+
+  // SIGINT/SIGTERM/SIGHUP must actually stop the loop. A handler that only logs
+  // leaves the process running, so a "killed" loop keeps dispatching workers.
   const controller = new AbortController()
   let signalled = false
+  let lock: LoopLock | null = null
   const onSignal = (signal: string) => {
     if (signalled) {
       log(`${signal} again, exiting now`)
-      process.exit(130)
+      void (async () => {
+        try {
+          await recorder.finish("interrupted", 130)
+        } catch {
+          // the record is best-effort on a forced exit
+        }
+        try {
+          await lock?.release()
+        } catch {
+          // the next run takes over a stale lock
+        }
+        process.exit(130)
+      })()
+      return
     }
     signalled = true
     log(`${signal} received, finishing the current step and stopping`)
@@ -350,13 +400,14 @@ export async function main(argv: string[]) {
   }
   process.on("SIGINT", () => onSignal("SIGINT"))
   process.on("SIGTERM", () => onSignal("SIGTERM"))
+  process.on("SIGHUP", () => onSignal("SIGHUP"))
   options.signal = controller.signal
 
-  let lock: LoopLock
   try {
     lock = await acquireLoopLock(cwd, options.dbPath)
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+    await recorder.finish("failed", 2)
     return 2
   }
   log(`lock: ${lock.path}`)
@@ -364,15 +415,31 @@ export async function main(argv: string[]) {
   let report: Awaited<ReturnType<typeof runProcessLoop>>
   try {
     report = await runProcessLoop(options)
-  } finally {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const exitCode = 1
     await lock.release()
+    lock = null
+    await recorder.finish("failed", exitCode)
+    log(`error: ${message}`)
+    log(`RESULT ${JSON.stringify(recorder.snapshot().result)}`)
+    return exitCode
+  } finally {
+    if (lock) await lock.release()
   }
   log(`status: ${report.status} after ${report.taskCount} task(s)`)
   for (const workflow of report.workflows) {
     log(`  #${workflow.taskID} ${workflow.status} (${workflow.attemptsUsed} attempt(s)) ${workflow.stopReason ?? ""}`.trimEnd())
   }
   if (report.error) log(`error: ${report.error}`)
-  return report.status === "failed" || report.status === "interrupted" ? 1 : 0
+
+  const status = report.status as ChainlinkRunStatus
+  const exitCode =
+    report.status === "failed" || report.status === "interrupted" || report.status === "exhausted" ? 1 : 0
+  await recorder.finish(status, exitCode)
+  const final = runResultSummary(recorder.snapshot(), recorder.path)
+  log(`RESULT ${JSON.stringify(final)}`)
+  return final.exitCode
 }
 
 export { collectStepOutput, opencodeRunArgs }

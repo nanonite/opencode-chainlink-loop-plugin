@@ -11,6 +11,7 @@ import {
   normalizeTaskIds,
   REVIEW_PARSE_FAILURE,
   reviewerPrompt,
+  taskFromShowOutput,
   truncate,
   workerPrompt,
   type ChainlinkCommandRunner,
@@ -19,6 +20,7 @@ import {
   type ChainlinkTask,
   type ChainlinkWorkflowOptions,
 } from "./chainlink-core"
+import type { ChainlinkTaskOutcome, ChainlinkVerifyResult } from "./chainlink-runs"
 import {
   createChainlinkWorkflow,
   failChainlinkWorkflow,
@@ -227,6 +229,18 @@ export function runStepProcess(input: ProcessStepInput, command: string, args: s
 export const spawnOpencodeRun: ProcessRunner = (input) =>
   runStepProcess(input, "opencode", opencodeRunArgs(input))
 
+export type ChainlinkRunEvent =
+  | { type: "task-started"; taskID: string; title: string; baseSha: string | null; maxAttempts: number }
+  | { type: "step"; taskID: string; attempt: number; step: "worker" | "reviewer" | "verify" | "closing" }
+  | {
+      type: "task-outcome"
+      taskID: string
+      outcome: ChainlinkTaskOutcome
+      attempts: number
+      verify?: ChainlinkVerifyResult | null
+      stopReason?: string | null
+    }
+
 export type ProcessLoopOptions = {
   ownerSessionID: string
   cwd: string
@@ -260,6 +274,22 @@ export type ProcessLoopOptions = {
    */
   startupRetries: number
   closeOnApproval: boolean
+  /**
+   * When set, an issue is closed only after a reviewer approval that also
+   * produced new commits and passed `--verify`. Otherwise it stays open.
+   */
+  closeIfVerified?: boolean
+  /** Deterministic acceptance command run after reviewer approval. */
+  verifyCommand?: string | null
+  verifyTimeoutSeconds?: number
+  /**
+   * Default true: halt the queue at the first task whose deterministic outcome
+   * is not "done". `--stop-on never` restores the old skip-and-continue policy.
+   */
+  stopOnNonDone?: boolean
+  /** Tasks already finished by a resumed run; never select them again. */
+  skipTaskIDs?: readonly string[]
+  onRunEvent?: (event: ChainlinkRunEvent) => void | Promise<void>
   /** "auto" reviews first when the tree already holds work for this task. */
   reviewFirst: "auto" | "always" | "never"
   /**
@@ -289,6 +319,7 @@ export type ProcessLoopReport = {
   status: "completed" | "exhausted" | "failed" | "idle" | "capped" | "interrupted"
   taskCount: number
   workflows: ChainlinkWorkflowSnapshot[]
+  outcomes: Record<string, ChainlinkTaskOutcome>
   error?: string
 }
 
@@ -302,6 +333,148 @@ function gitRunner(args: readonly string[], cwd: string) {
     child.on("error", () => resolve(""))
     child.on("close", () => resolve(out))
   })
+}
+
+/** The task's base commit, or null when the workspace is not a git repository. */
+export async function gitHead(cwd: string): Promise<string | null> {
+  const value = (await gitRunner(["rev-parse", "HEAD"], cwd)).trim()
+  return value || null
+}
+
+/**
+ * Counts commits made since the task started. A null result means git could not
+ * answer, which is treated as "no proven change" by the classifier.
+ */
+export async function gitCommitCountSince(cwd: string, baseSha: string | null): Promise<number | null> {
+  if (!baseSha) return null
+  const raw = (await gitRunner(["rev-list", "--count", `${baseSha}..HEAD`], cwd)).trim()
+  if (!/^\d+$/.test(raw)) return null
+  return Number(raw)
+}
+
+/**
+ * Deterministic escalation signal on the issue itself: a blocked relationship or
+ * flag, a blocking label, a blocker comment, or an explicit escalation comment.
+ */
+export function taskIsEscalated(task: ChainlinkTask): boolean {
+  if (task.blocked === true || task.status === "blocked") return true
+  if (Array.isArray(task.blocked_by) && task.blocked_by.length > 0) return true
+  const labels = Array.isArray(task.labels) ? task.labels.map((label) => String(label)) : []
+  if (labels.some((label) => /^(blocked|escalat(?:ed|ion))$/i.test(label))) return true
+  const comments = Array.isArray(task.comments) ? task.comments : []
+  return comments.some((comment) => {
+    if (typeof comment !== "object" || comment === null) return false
+    const record = comment as Record<string, unknown>
+    if (typeof record.kind === "string" && /^(blocker|escalation)$/i.test(record.kind)) return true
+    return typeof record.content === "string" && /\bescalat(?:e|ed|ion)\b/i.test(record.content)
+  })
+}
+
+async function refreshTask(options: ProcessLoopOptions, task: ChainlinkTask): Promise<ChainlinkTask> {
+  try {
+    const show = await options.runner([...options.showArgs, task.id], options.cwd, options.dbPath)
+    return taskFromShowOutput(show.stdout, task)
+  } catch {
+    return task
+  }
+}
+
+/**
+ * Runs the operator's acceptance command in the worktree. It is a process, not a
+ * model: exit 0 is the only pass, and the output tail is the finding handed back
+ * to the worker when it fails.
+ */
+export function runVerifyCommand(
+  command: string,
+  cwd: string,
+  timeoutSeconds: number,
+  signal?: AbortSignal,
+): Promise<ChainlinkVerifyResult> {
+  return new Promise<ChainlinkVerifyResult>((resolve) => {
+    const started = Date.now()
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    })
+    let stdout = ""
+    let stderr = ""
+    let timedOut = false
+    let aborted = false
+    let settled = false
+
+    const kill = () => {
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGKILL")
+      } catch {
+        try {
+          child.kill("SIGKILL")
+        } catch {
+          // already gone
+        }
+      }
+    }
+    const timer =
+      timeoutSeconds > 0
+        ? setTimeout(() => {
+            timedOut = true
+            kill()
+          }, timeoutSeconds * 1000)
+        : undefined
+    const onAbort = () => {
+      aborted = true
+      kill()
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+
+    const settle = (exitCode: number | null) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      signal?.removeEventListener("abort", onAbort)
+      const output = `${stdout}${stderr}`.trim()
+      const outputTail = output.length > 8000 ? output.slice(-8000) : output
+      resolve({
+        command,
+        exitCode,
+        passed: !timedOut && !aborted && exitCode === 0,
+        timedOut,
+        durationMs: Date.now() - started,
+        outputTail,
+      })
+    }
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8")
+      if (stdout.length > 200_000) stdout = stdout.slice(-100_000)
+    })
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8")
+      if (stderr.length > 200_000) stderr = stderr.slice(-100_000)
+    })
+    child.on("error", () => settle(null))
+    child.on("close", (code) => settle(code))
+  })
+}
+
+/**
+ * Reviewer approval is necessary but never sufficient. "done" needs a commit
+ * made since the task's base sha, no escalation on the issue, and (when
+ * configured) a passing --verify command.
+ */
+export async function classifyApprovedOutcome(
+  options: ProcessLoopOptions,
+  task: ChainlinkTask,
+  baseSha: string | null,
+  verify: ChainlinkVerifyResult | null,
+): Promise<ChainlinkTaskOutcome> {
+  if (verify && !verify.passed) return "verify-failed"
+  const fresh = await refreshTask(options, task)
+  if (taskIsEscalated(fresh)) return "approved-but-escalated"
+  const commits = await gitCommitCountSince(options.cwd, baseSha)
+  if (commits == null || commits === 0) return "approved-no-changes"
+  return "done"
 }
 
 /**
@@ -348,6 +521,15 @@ export function reviewLogLine(taskID: string, attempt: number, review: Chainlink
   return `task ${taskID} attempt ${attempt}: ${outcome}`
 }
 
+export type ProcessInnerResult = {
+  status: "completed" | "exhausted" | "failed" | "interrupted"
+  outcome: ChainlinkTaskOutcome
+  error?: string
+  review?: ChainlinkReview
+  verify?: ChainlinkVerifyResult | null
+  baseSha: string | null
+}
+
 /**
  * Runs one task to approval, exhaustion or failure using one-shot processes.
  * There is no model in the control path: this function picks the task, counts
@@ -357,12 +539,24 @@ export async function runProcessInnerLoop(
   options: ProcessLoopOptions,
   workflow: ChainlinkWorkflowSnapshot,
   task: ChainlinkTask,
-): Promise<{ status: "completed" | "exhausted" | "failed" | "interrupted"; error?: string; review?: ChainlinkReview }> {
+): Promise<ProcessInnerResult> {
   const log = options.log ?? (() => undefined)
   const promptContext = { ...workflow, taskID: task.id, taskTitle: task.title }
   let workerSessionID: string | null = null
   let workerOutput = ""
   let existingWork = false
+  let pendingReview: ChainlinkReview | null = null
+
+  const baseSha = await gitHead(options.cwd)
+  const emit = async (event: ChainlinkRunEvent) => {
+    try {
+      await options.onRunEvent?.(event)
+    } catch (error) {
+      // A record write must never turn a working loop into a failed one.
+      log(`run record update failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  await emit({ type: "task-started", taskID: task.id, title: task.title, baseSha, maxAttempts: workflow.maxAttempts })
 
   const detection = await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID))
   const reviewFirst = options.reviewFirst === "always" || (options.reviewFirst === "auto" && detection.existing)
@@ -401,6 +595,7 @@ export async function runProcessInnerLoop(
   const runReviewer = async (attempt: number): Promise<ChainlinkReview> => {
     let lastFailure: string | null = null
     for (let retry = 0; retry <= reviewerStepRetries; retry += 1) {
+      await emit({ type: "step", taskID: task.id, attempt, step: "reviewer" })
       const result = await runStep({
         cwd: options.cwd,
         prompt: reviewerPrompt(promptContext, task, attempt, workerOutput, options.customPrompt),
@@ -440,6 +635,65 @@ export async function runProcessInnerLoop(
     throw new Error(message)
   }
 
+  /**
+   * Handles a reviewer approval: run the acceptance gate, classify the outcome
+   * from deterministic facts, and close only a genuinely done task. A failed
+   * verification returns null after setting pendingReview, so the same worker
+   * session gets the command output as findings on the next attempt.
+   */
+  const finishApproved = async (attempt: number, review: ChainlinkReview): Promise<ProcessInnerResult | null> => {
+    let verify: ChainlinkVerifyResult | null = null
+    if (options.verifyCommand?.trim()) {
+      await emit({ type: "step", taskID: task.id, attempt, step: "verify" })
+      log(`task ${task.id} attempt ${attempt}: verify ${options.verifyCommand}`)
+      verify = await runVerifyCommand(
+        options.verifyCommand,
+        options.cwd,
+        options.verifyTimeoutSeconds ?? 600,
+        options.signal,
+      )
+      log(
+        `task ${task.id} attempt ${attempt}: verify ${
+          verify.passed ? "passed" : `failed (exit ${verify.exitCode ?? "timeout"})`
+        }`,
+      )
+    }
+    const outcome = await classifyApprovedOutcome(options, task, baseSha, verify)
+    if (outcome === "verify-failed") {
+      const tail = verify?.outputTail.trim() || "The verification command failed without output."
+      pendingReview = {
+        approved: false,
+        summary: `Verification failed (exit ${verify?.exitCode ?? "timeout"}).`,
+        findings: [truncate(tail, 8000)],
+        nextAction: "Fix the verification failure, rerun the command, and report the result.",
+      }
+      log(`task ${task.id} attempt ${attempt}: verification failed; feeding output back as findings`)
+      if (attempt >= workflow.maxAttempts) {
+        await finishChainlinkWorkflow(workflow.id, "exhausted", `verification failed after ${attempt} attempt(s)`)
+        return { status: "exhausted", outcome, review, verify, baseSha }
+      }
+      return null
+    }
+
+    const shouldClose =
+      outcome === "done" && options.closeOnApproval && (!options.closeIfVerified || verify?.passed === true)
+    if (shouldClose) {
+      await emit({ type: "step", taskID: task.id, attempt, step: "closing" })
+      await recordChainlinkClosing(workflow.id)
+      await closeTask(options as unknown as ChainlinkWorkflowOptions, task.id)
+    }
+    const reason =
+      outcome === "done"
+        ? shouldClose
+          ? "reviewer approved and issue closed"
+          : "reviewer approved; issue left open"
+        : outcome === "approved-no-changes"
+          ? `reviewer approved but no new commits since ${baseSha ?? "the task base"}`
+          : "reviewer approved but the issue is escalated or blocked"
+    await finishChainlinkWorkflow(workflow.id, "completed", reason, shouldClose)
+    return { status: "completed", outcome, review, verify, baseSha }
+  }
+
   // Someone may already have done this task. Review before adding to it.
   if (reviewFirst) {
     existingWork = true
@@ -448,28 +702,26 @@ export async function runProcessInnerLoop(
     const review = await runReviewer(1)
     await recordChainlinkReview(workflow.id, "", JSON.stringify(review), 1)
     if (review.approved) {
-      await recordChainlinkClosing(workflow.id)
-      if (options.closeOnApproval) await closeTask(options as unknown as ChainlinkWorkflowOptions, task.id)
-      await finishChainlinkWorkflow(workflow.id, "completed", "reviewer approved existing work")
-      return { status: "completed", review }
-    }
-    if (workflow.maxAttempts <= 1) {
+      const approved = await finishApproved(1, review)
+      if (approved) return approved
+      // Verification failed and findings are pending: continue into the worker loop.
+    } else if (workflow.maxAttempts <= 1) {
       await finishChainlinkWorkflow(workflow.id, "exhausted", "attempt limit reached without approval")
-      return { status: "exhausted", review }
+      return { status: "exhausted", outcome: "exhausted", review, baseSha }
     }
   }
 
-  let pendingReview: ChainlinkReview | null = null
   for (let attempt = 1; attempt <= workflow.maxAttempts; attempt += 1) {
     if (options.signal?.aborted) {
       await failChainlinkWorkflow(workflow.id, "Chainlink loop cancelled")
-      return { status: "interrupted", error: "Chainlink loop cancelled" }
+      return { status: "interrupted", outcome: "interrupted", error: "Chainlink loop cancelled", baseSha }
     }
 
     const first = attempt === 1 && !existingWork && !pendingReview
     // After the first rejection the next worker turn carries the review
     // findings, so the same session keeps its context instead of restarting.
     const prompt = pendingReview ? feedbackPrompt(promptContext, pendingReview, options.customPrompt) : workerPrompt(promptContext, task, attempt, undefined, options.customPrompt)
+    await emit({ type: "step", taskID: task.id, attempt, step: "worker" })
     log(`task ${task.id} attempt ${attempt}/${workflow.maxAttempts}: worker ${first ? "start" : "resume"}`)
     const worker = await runStep({
       cwd: options.cwd,
@@ -495,7 +747,7 @@ export async function runProcessInnerLoop(
       const error = `Chainlink ${task.id} worker did not start (no output after ${options.startupTimeoutSeconds}s after ${worker.durationMs}ms, exit ${worker.exitCode ?? "killed"})${stderr ? `: ${truncate(stderr, 300)}` : ""}`
       log(`task ${task.id} attempt ${attempt}: worker did not start after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`)
       await failChainlinkWorkflow(workflow.id, error)
-      return { status: "failed", error }
+      return { status: "failed", outcome: "crashed", error, baseSha }
     }
     if (worker.timedOut || worker.aborted) {
       const reason = worker.timedOut
@@ -509,14 +761,19 @@ export async function runProcessInnerLoop(
       )
       const error = `Chainlink ${task.id} worker ${reason}`
       await failChainlinkWorkflow(workflow.id, error)
-      return { status: "failed", error }
+      return {
+        status: worker.aborted ? "interrupted" : "failed",
+        outcome: worker.aborted ? "interrupted" : "crashed",
+        error,
+        baseSha,
+      }
     }
     if (!workerOutput.trim()) {
       const stderr = worker.stderr.trim()
       const error = `Chainlink worker ${task.id} produced no report (exit ${worker.exitCode ?? "spawn error"}, ${worker.durationMs}ms)${stderr ? `: ${truncate(stderr, 300)}` : ""}`
       log(`task ${task.id} attempt ${attempt}: worker produced no report after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`)
       await failChainlinkWorkflow(workflow.id, error)
-      return { status: "failed", error }
+      return { status: "failed", outcome: "crashed", error, baseSha }
     }
 
     const review = await runReviewer(attempt)
@@ -524,25 +781,19 @@ export async function runProcessInnerLoop(
     log(reviewLogLine(task.id, attempt, review))
 
     if (review.approved) {
-      await recordChainlinkClosing(workflow.id)
-      if (options.closeOnApproval) await closeTask(options as unknown as ChainlinkWorkflowOptions, task.id)
-      await finishChainlinkWorkflow(
-        workflow.id,
-        "completed",
-        options.closeOnApproval ? "reviewer approved and issue closed" : "reviewer approved; issue left open",
-        options.closeOnApproval,
-      )
-      return { status: "completed", review }
+      const approved = await finishApproved(attempt, review)
+      if (approved) return approved
+      continue
     }
     if (attempt === workflow.maxAttempts) {
       await finishChainlinkWorkflow(workflow.id, "exhausted", `attempt limit ${workflow.maxAttempts} reached`)
-      return { status: "exhausted", review }
+      return { status: "exhausted", outcome: "exhausted", review, baseSha }
     }
     pendingReview = review
   }
 
   await finishChainlinkWorkflow(workflow.id, "exhausted", "attempt limit reached")
-  return { status: "exhausted" }
+  return { status: "exhausted", outcome: "exhausted", baseSha }
 }
 
 /**
@@ -557,12 +808,23 @@ export async function runProcessInnerLoop(
 export async function runProcessLoop(options: ProcessLoopOptions): Promise<ProcessLoopReport> {
   const log = options.log ?? (() => undefined)
   const workflows: ChainlinkWorkflowSnapshot[] = []
+  const outcomes: Record<string, ChainlinkTaskOutcome> = {}
   const seen = new Set<string>()
   const exhausted = new Set<string>()
+  const skip = new Set((options.skipTaskIDs ?? []).map((id) => id.replace(/^#/, "")))
   const requested = options.taskIds?.length ? [...new Set(normalizeTaskIds(options.taskIds))] : null
   let index = 0
   let taskCount = 0
   let sawExhausted = false
+  const stopOnNonDone = options.stopOnNonDone !== false
+
+  const emit = async (event: ChainlinkRunEvent) => {
+    try {
+      await options.onRunEvent?.(event)
+    } catch (error) {
+      log(`run record update failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
 
   const chainlinkOptions = {
     ...options,
@@ -571,13 +833,14 @@ export async function runProcessLoop(options: ProcessLoopOptions): Promise<Proce
 
   const pickNext = async (): Promise<ChainlinkTask | undefined> => {
     const first = await fetchNextTask(chainlinkOptions)
-    if (!first || !seen.has(first.id)) return first
+    if (!first || (!seen.has(first.id) && !skip.has(first.id))) return first
     // `next` is stuck on a task we already handled: scan the ready set instead.
     const excluded = new Set((options.excludeIDs ?? []).map((id) => id.replace(/^#/, "")))
     const ready = await fetchReadyTasks(chainlinkOptions)
     return ready.find(
       (candidate) =>
         !seen.has(candidate.id) &&
+        !skip.has(candidate.id) &&
         !excluded.has(candidate.id) &&
         (typeof candidate.parent_id !== "string" && typeof candidate.parent_id !== "number"
           ? true
@@ -587,9 +850,11 @@ export async function runProcessLoop(options: ProcessLoopOptions): Promise<Proce
 
   while (true) {
     const done = (): ProcessLoopReport =>
-      sawExhausted ? { status: "exhausted", taskCount, workflows } : { status: "completed", taskCount, workflows }
-    if (options.signal?.aborted) return { status: "interrupted", taskCount, workflows, error: "cancelled" }
-    if (options.maxTasks != null && taskCount >= options.maxTasks) return { status: "capped", taskCount, workflows }
+      sawExhausted
+        ? { status: "exhausted", taskCount, workflows, outcomes }
+        : { status: "completed", taskCount, workflows, outcomes }
+    if (options.signal?.aborted) return { status: "interrupted", taskCount, workflows, outcomes, error: "cancelled" }
+    if (options.maxTasks != null && taskCount >= options.maxTasks) return { status: "capped", taskCount, workflows, outcomes }
     if (requested && index >= requested.length) return done()
 
     let task: ChainlinkTask | undefined
@@ -602,13 +867,14 @@ export async function runProcessLoop(options: ProcessLoopOptions): Promise<Proce
       if (!requested && seen.has(message.match(/#?(\d+)/)?.[1] ? `#${message.match(/#?(\d+)/)![1]}` : "")) {
         return done()
       }
-      return { status: "failed", taskCount, workflows, error: message }
+      return { status: "failed", taskCount, workflows, outcomes, error: message }
     }
-    if (!task) return sawExhausted ? { status: "exhausted", taskCount, workflows } : { status: "idle", taskCount, workflows }
+    if (!task) return sawExhausted ? { status: "exhausted", taskCount, workflows, outcomes } : { status: "idle", taskCount, workflows, outcomes }
     if (seen.has(task.id)) {
-      if (requested) return { status: "failed", taskCount, workflows, error: `Chainlink returned duplicate task ${task.id}` }
+      if (requested) return { status: "failed", taskCount, workflows, outcomes, error: `Chainlink returned duplicate task ${task.id}` }
       return done()
     }
+    if (skip.has(task.id)) continue
     seen.add(task.id)
 
     const workflow = await createChainlinkWorkflow({
@@ -625,6 +891,7 @@ export async function runProcessLoop(options: ProcessLoopOptions): Promise<Proce
 
     try {
       const result = await runProcessInnerLoop(options, workflow, task)
+      outcomes[task.id] = result.outcome
       if (result.status === "exhausted") {
         sawExhausted = true
         exhausted.add(task.id)
@@ -634,14 +901,54 @@ export async function runProcessLoop(options: ProcessLoopOptions): Promise<Proce
       workflows[workflows.length - 1] = (await listChainlinkWorkflows(options.ownerSessionID)).find(
         (candidate) => candidate.id === workflow.id,
       ) ?? workflow
+      const attempts = workflows[workflows.length - 1]!.attemptsUsed
+      await emit({
+        type: "task-outcome",
+        taskID: task.id,
+        outcome: result.outcome,
+        attempts,
+        verify: result.verify ?? null,
+        stopReason: result.error ?? result.review?.summary ?? null,
+      })
       if (result.status === "failed" || result.status === "interrupted") {
-        return { status: result.status === "interrupted" ? "interrupted" : "failed", taskCount, workflows, error: result.error }
+        return {
+          status: result.status === "interrupted" ? "interrupted" : "failed",
+          taskCount,
+          workflows,
+          outcomes,
+          error: result.error,
+        }
+      }
+      if (stopOnNonDone && result.outcome !== "done") {
+        log(`task ${task.id}: outcome ${result.outcome}; stopping because --stop-on is non-done`)
+        return {
+          status: result.status,
+          taskCount,
+          workflows,
+          outcomes,
+          error: result.error,
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const failed = await failChainlinkWorkflow(workflow.id, message).catch(() => null)
       if (failed) workflows[workflows.length - 1] = failed
-      return { status: "failed", taskCount, workflows, error: message }
+      const outcome: ChainlinkTaskOutcome = options.signal?.aborted ? "interrupted" : "crashed"
+      outcomes[task.id] = outcome
+      await emit({
+        type: "task-outcome",
+        taskID: task.id,
+        outcome,
+        attempts: workflows[workflows.length - 1]!.attemptsUsed,
+        stopReason: message,
+      })
+      return {
+        status: options.signal?.aborted ? "interrupted" : "failed",
+        taskCount,
+        workflows,
+        outcomes,
+        error: message,
+      }
     }
   }
 }

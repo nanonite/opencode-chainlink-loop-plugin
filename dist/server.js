@@ -542,9 +542,9 @@ var injectedVersion = readString("0.3.1");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-45-g42dd1ca"),
-  gitSha: readString("42dd1ca"),
-  gitDirty: false,
+  gitDescribe: readString("v0.1.8-46-g512af70"),
+  gitSha: readString("512af70"),
+  gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
 function formatBuildInfo(info = BUILD_INFO) {

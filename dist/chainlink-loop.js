@@ -838,6 +838,120 @@ function gitRunner(args, cwd) {
     child.on("close", () => resolve(out));
   });
 }
+async function gitHead(cwd) {
+  const value = (await gitRunner(["rev-parse", "HEAD"], cwd)).trim();
+  return value || null;
+}
+async function gitCommitCountSince(cwd, baseSha) {
+  if (!baseSha)
+    return null;
+  const raw = (await gitRunner(["rev-list", "--count", `${baseSha}..HEAD`], cwd)).trim();
+  if (!/^\d+$/.test(raw))
+    return null;
+  return Number(raw);
+}
+function taskIsEscalated(task) {
+  if (task.blocked === true || task.status === "blocked")
+    return true;
+  if (Array.isArray(task.blocked_by) && task.blocked_by.length > 0)
+    return true;
+  const labels = Array.isArray(task.labels) ? task.labels.map((label) => String(label)) : [];
+  if (labels.some((label) => /^(blocked|escalat(?:ed|ion))$/i.test(label)))
+    return true;
+  const comments = Array.isArray(task.comments) ? task.comments : [];
+  return comments.some((comment) => {
+    if (typeof comment !== "object" || comment === null)
+      return false;
+    const record = comment;
+    if (typeof record.kind === "string" && /^(blocker|escalation)$/i.test(record.kind))
+      return true;
+    return typeof record.content === "string" && /\bescalat(?:e|ed|ion)\b/i.test(record.content);
+  });
+}
+async function refreshTask(options, task) {
+  try {
+    const show = await options.runner([...options.showArgs, task.id], options.cwd, options.dbPath);
+    return taskFromShowOutput(show.stdout, task);
+  } catch {
+    return task;
+  }
+}
+function runVerifyCommand(command, cwd, timeoutSeconds, signal) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let aborted = false;
+    let settled = false;
+    const kill = () => {
+      try {
+        if (child.pid)
+          process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }
+    };
+    const timer = timeoutSeconds > 0 ? setTimeout(() => {
+      timedOut = true;
+      kill();
+    }, timeoutSeconds * 1000) : undefined;
+    const onAbort = () => {
+      aborted = true;
+      kill();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const settle = (exitCode) => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer)
+        clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      const output = `${stdout}${stderr}`.trim();
+      const outputTail = output.length > 8000 ? output.slice(-8000) : output;
+      resolve({
+        command,
+        exitCode,
+        passed: !timedOut && !aborted && exitCode === 0,
+        timedOut,
+        durationMs: Date.now() - started,
+        outputTail
+      });
+    };
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+      if (stdout.length > 200000)
+        stdout = stdout.slice(-1e5);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+      if (stderr.length > 200000)
+        stderr = stderr.slice(-1e5);
+    });
+    child.on("error", () => settle(null));
+    child.on("close", (code) => settle(code));
+  });
+}
+async function classifyApprovedOutcome(options, task, baseSha, verify) {
+  if (verify && !verify.passed)
+    return "verify-failed";
+  const fresh = await refreshTask(options, task);
+  if (taskIsEscalated(fresh))
+    return "approved-but-escalated";
+  const commits = await gitCommitCountSince(options.cwd, baseSha);
+  if (commits == null || commits === 0)
+    return "approved-no-changes";
+  return "done";
+}
 async function detectExistingWork(cwd, task, priorWorkflows = []) {
   const status = (await gitRunner(["status", "--porcelain"], cwd)).trim();
   if (status)
@@ -871,6 +985,16 @@ async function runProcessInnerLoop(options, workflow, task) {
   let workerSessionID = null;
   let workerOutput = "";
   let existingWork = false;
+  let pendingReview = null;
+  const baseSha = await gitHead(options.cwd);
+  const emit = async (event) => {
+    try {
+      await options.onRunEvent?.(event);
+    } catch (error) {
+      log(`run record update failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  await emit({ type: "task-started", taskID: task.id, title: task.title, baseSha, maxAttempts: workflow.maxAttempts });
   const detection = await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID));
   const reviewFirst = options.reviewFirst === "always" || options.reviewFirst === "auto" && detection.existing;
   const reviewerStepRetries = Math.max(0, options.reviewerStepRetries ?? 0);
@@ -889,6 +1013,7 @@ async function runProcessInnerLoop(options, workflow, task) {
   const runReviewer = async (attempt) => {
     let lastFailure = null;
     for (let retry = 0;retry <= reviewerStepRetries; retry += 1) {
+      await emit({ type: "step", taskID: task.id, attempt, step: "reviewer" });
       const result = await runStep({
         cwd: options.cwd,
         prompt: reviewerPrompt(promptContext, task, attempt, workerOutput, options.customPrompt),
@@ -915,6 +1040,40 @@ async function runProcessInnerLoop(options, workflow, task) {
     await failChainlinkWorkflow(workflow.id, message).catch(() => null);
     throw new Error(message);
   };
+  const finishApproved = async (attempt, review) => {
+    let verify = null;
+    if (options.verifyCommand?.trim()) {
+      await emit({ type: "step", taskID: task.id, attempt, step: "verify" });
+      log(`task ${task.id} attempt ${attempt}: verify ${options.verifyCommand}`);
+      verify = await runVerifyCommand(options.verifyCommand, options.cwd, options.verifyTimeoutSeconds ?? 600, options.signal);
+      log(`task ${task.id} attempt ${attempt}: verify ${verify.passed ? "passed" : `failed (exit ${verify.exitCode ?? "timeout"})`}`);
+    }
+    const outcome = await classifyApprovedOutcome(options, task, baseSha, verify);
+    if (outcome === "verify-failed") {
+      const tail = verify?.outputTail.trim() || "The verification command failed without output.";
+      pendingReview = {
+        approved: false,
+        summary: `Verification failed (exit ${verify?.exitCode ?? "timeout"}).`,
+        findings: [truncate(tail, 8000)],
+        nextAction: "Fix the verification failure, rerun the command, and report the result."
+      };
+      log(`task ${task.id} attempt ${attempt}: verification failed; feeding output back as findings`);
+      if (attempt >= workflow.maxAttempts) {
+        await finishChainlinkWorkflow(workflow.id, "exhausted", `verification failed after ${attempt} attempt(s)`);
+        return { status: "exhausted", outcome, review, verify, baseSha };
+      }
+      return null;
+    }
+    const shouldClose = outcome === "done" && options.closeOnApproval && (!options.closeIfVerified || verify?.passed === true);
+    if (shouldClose) {
+      await emit({ type: "step", taskID: task.id, attempt, step: "closing" });
+      await recordChainlinkClosing(workflow.id);
+      await closeTask(options, task.id);
+    }
+    const reason = outcome === "done" ? shouldClose ? "reviewer approved and issue closed" : "reviewer approved; issue left open" : outcome === "approved-no-changes" ? `reviewer approved but no new commits since ${baseSha ?? "the task base"}` : "reviewer approved but the issue is escalated or blocked";
+    await finishChainlinkWorkflow(workflow.id, "completed", reason, shouldClose);
+    return { status: "completed", outcome, review, verify, baseSha };
+  };
   if (reviewFirst) {
     existingWork = true;
     workerOutput = "(no worker report: reviewing work already present in the working tree)";
@@ -922,25 +1081,22 @@ async function runProcessInnerLoop(options, workflow, task) {
     const review = await runReviewer(1);
     await recordChainlinkReview(workflow.id, "", JSON.stringify(review), 1);
     if (review.approved) {
-      await recordChainlinkClosing(workflow.id);
-      if (options.closeOnApproval)
-        await closeTask(options, task.id);
-      await finishChainlinkWorkflow(workflow.id, "completed", "reviewer approved existing work");
-      return { status: "completed", review };
-    }
-    if (workflow.maxAttempts <= 1) {
+      const approved = await finishApproved(1, review);
+      if (approved)
+        return approved;
+    } else if (workflow.maxAttempts <= 1) {
       await finishChainlinkWorkflow(workflow.id, "exhausted", "attempt limit reached without approval");
-      return { status: "exhausted", review };
+      return { status: "exhausted", outcome: "exhausted", review, baseSha };
     }
   }
-  let pendingReview = null;
   for (let attempt = 1;attempt <= workflow.maxAttempts; attempt += 1) {
     if (options.signal?.aborted) {
       await failChainlinkWorkflow(workflow.id, "Chainlink loop cancelled");
-      return { status: "interrupted", error: "Chainlink loop cancelled" };
+      return { status: "interrupted", outcome: "interrupted", error: "Chainlink loop cancelled", baseSha };
     }
     const first = attempt === 1 && !existingWork && !pendingReview;
     const prompt = pendingReview ? feedbackPrompt(promptContext, pendingReview, options.customPrompt) : workerPrompt(promptContext, task, attempt, undefined, options.customPrompt);
+    await emit({ type: "step", taskID: task.id, attempt, step: "worker" });
     log(`task ${task.id} attempt ${attempt}/${workflow.maxAttempts}: worker ${first ? "start" : "resume"}`);
     const worker = await runStep({
       cwd: options.cwd,
@@ -966,7 +1122,7 @@ async function runProcessInnerLoop(options, workflow, task) {
       const error = `Chainlink ${task.id} worker did not start (no output after ${options.startupTimeoutSeconds}s after ${worker.durationMs}ms, exit ${worker.exitCode ?? "killed"})${stderr ? `: ${truncate(stderr, 300)}` : ""}`;
       log(`task ${task.id} attempt ${attempt}: worker did not start after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`);
       await failChainlinkWorkflow(workflow.id, error);
-      return { status: "failed", error };
+      return { status: "failed", outcome: "crashed", error, baseSha };
     }
     if (worker.timedOut || worker.aborted) {
       const reason = worker.timedOut ? `timed out after ${options.workerTimeoutSeconds}s` : "process was cancelled";
@@ -975,63 +1131,77 @@ async function runProcessInnerLoop(options, workflow, task) {
       log(`task ${task.id} attempt ${attempt}: worker ${reason} after ${worker.durationMs}ms (exit ${worker.exitCode ?? "killed"}${killed})` + `${stderr ? `: ${truncate(stderr, 300)}` : ""}`);
       const error = `Chainlink ${task.id} worker ${reason}`;
       await failChainlinkWorkflow(workflow.id, error);
-      return { status: "failed", error };
+      return {
+        status: worker.aborted ? "interrupted" : "failed",
+        outcome: worker.aborted ? "interrupted" : "crashed",
+        error,
+        baseSha
+      };
     }
     if (!workerOutput.trim()) {
       const stderr = worker.stderr.trim();
       const error = `Chainlink worker ${task.id} produced no report (exit ${worker.exitCode ?? "spawn error"}, ${worker.durationMs}ms)${stderr ? `: ${truncate(stderr, 300)}` : ""}`;
       log(`task ${task.id} attempt ${attempt}: worker produced no report after ${worker.durationMs}ms${stderr ? `: ${truncate(stderr, 300)}` : ""}`);
       await failChainlinkWorkflow(workflow.id, error);
-      return { status: "failed", error };
+      return { status: "failed", outcome: "crashed", error, baseSha };
     }
     const review = await runReviewer(attempt);
     await recordChainlinkReview(workflow.id, "", JSON.stringify(review), attempt);
     log(reviewLogLine(task.id, attempt, review));
     if (review.approved) {
-      await recordChainlinkClosing(workflow.id);
-      if (options.closeOnApproval)
-        await closeTask(options, task.id);
-      await finishChainlinkWorkflow(workflow.id, "completed", options.closeOnApproval ? "reviewer approved and issue closed" : "reviewer approved; issue left open", options.closeOnApproval);
-      return { status: "completed", review };
+      const approved = await finishApproved(attempt, review);
+      if (approved)
+        return approved;
+      continue;
     }
     if (attempt === workflow.maxAttempts) {
       await finishChainlinkWorkflow(workflow.id, "exhausted", `attempt limit ${workflow.maxAttempts} reached`);
-      return { status: "exhausted", review };
+      return { status: "exhausted", outcome: "exhausted", review, baseSha };
     }
     pendingReview = review;
   }
   await finishChainlinkWorkflow(workflow.id, "exhausted", "attempt limit reached");
-  return { status: "exhausted" };
+  return { status: "exhausted", outcome: "exhausted", baseSha };
 }
 async function runProcessLoop(options) {
   const log = options.log ?? (() => {
     return;
   });
   const workflows = [];
+  const outcomes = {};
   const seen = new Set;
   const exhausted = new Set;
+  const skip = new Set((options.skipTaskIDs ?? []).map((id) => id.replace(/^#/, "")));
   const requested = options.taskIds?.length ? [...new Set(normalizeTaskIds(options.taskIds))] : null;
   let index = 0;
   let taskCount = 0;
   let sawExhausted = false;
+  const stopOnNonDone = options.stopOnNonDone !== false;
+  const emit = async (event) => {
+    try {
+      await options.onRunEvent?.(event);
+    } catch (error) {
+      log(`run record update failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   const chainlinkOptions = {
     ...options,
     closeOnApproval: options.closeOnApproval
   };
   const pickNext = async () => {
     const first = await fetchNextTask(chainlinkOptions);
-    if (!first || !seen.has(first.id))
+    if (!first || !seen.has(first.id) && !skip.has(first.id))
       return first;
     const excluded = new Set((options.excludeIDs ?? []).map((id) => id.replace(/^#/, "")));
     const ready = await fetchReadyTasks(chainlinkOptions);
-    return ready.find((candidate) => !seen.has(candidate.id) && !excluded.has(candidate.id) && (typeof candidate.parent_id !== "string" && typeof candidate.parent_id !== "number" ? true : !excluded.has(String(candidate.parent_id))));
+    return ready.find((candidate) => !seen.has(candidate.id) && !skip.has(candidate.id) && !excluded.has(candidate.id) && (typeof candidate.parent_id !== "string" && typeof candidate.parent_id !== "number" ? true : !excluded.has(String(candidate.parent_id))));
   };
   while (true) {
-    const done = () => sawExhausted ? { status: "exhausted", taskCount, workflows } : { status: "completed", taskCount, workflows };
+    const done = () => sawExhausted ? { status: "exhausted", taskCount, workflows, outcomes } : { status: "completed", taskCount, workflows, outcomes };
     if (options.signal?.aborted)
-      return { status: "interrupted", taskCount, workflows, error: "cancelled" };
+      return { status: "interrupted", taskCount, workflows, outcomes, error: "cancelled" };
     if (options.maxTasks != null && taskCount >= options.maxTasks)
-      return { status: "capped", taskCount, workflows };
+      return { status: "capped", taskCount, workflows, outcomes };
     if (requested && index >= requested.length)
       return done();
     let task;
@@ -1042,15 +1212,17 @@ async function runProcessLoop(options) {
       if (!requested && seen.has(message.match(/#?(\d+)/)?.[1] ? `#${message.match(/#?(\d+)/)[1]}` : "")) {
         return done();
       }
-      return { status: "failed", taskCount, workflows, error: message };
+      return { status: "failed", taskCount, workflows, outcomes, error: message };
     }
     if (!task)
-      return sawExhausted ? { status: "exhausted", taskCount, workflows } : { status: "idle", taskCount, workflows };
+      return sawExhausted ? { status: "exhausted", taskCount, workflows, outcomes } : { status: "idle", taskCount, workflows, outcomes };
     if (seen.has(task.id)) {
       if (requested)
-        return { status: "failed", taskCount, workflows, error: `Chainlink returned duplicate task ${task.id}` };
+        return { status: "failed", taskCount, workflows, outcomes, error: `Chainlink returned duplicate task ${task.id}` };
       return done();
     }
+    if (skip.has(task.id))
+      continue;
     seen.add(task.id);
     const workflow = await createChainlinkWorkflow({
       ownerSessionID: options.ownerSessionID,
@@ -1065,21 +1237,62 @@ async function runProcessLoop(options) {
     log(`task ${task.id}: ${task.title}`);
     try {
       const result = await runProcessInnerLoop(options, workflow, task);
+      outcomes[task.id] = result.outcome;
       if (result.status === "exhausted") {
         sawExhausted = true;
         exhausted.add(task.id);
         log(`task ${task.id}: attempt limit reached, leaving it open and moving on`);
       }
       workflows[workflows.length - 1] = (await listChainlinkWorkflows(options.ownerSessionID)).find((candidate) => candidate.id === workflow.id) ?? workflow;
+      const attempts = workflows[workflows.length - 1].attemptsUsed;
+      await emit({
+        type: "task-outcome",
+        taskID: task.id,
+        outcome: result.outcome,
+        attempts,
+        verify: result.verify ?? null,
+        stopReason: result.error ?? result.review?.summary ?? null
+      });
       if (result.status === "failed" || result.status === "interrupted") {
-        return { status: result.status === "interrupted" ? "interrupted" : "failed", taskCount, workflows, error: result.error };
+        return {
+          status: result.status === "interrupted" ? "interrupted" : "failed",
+          taskCount,
+          workflows,
+          outcomes,
+          error: result.error
+        };
+      }
+      if (stopOnNonDone && result.outcome !== "done") {
+        log(`task ${task.id}: outcome ${result.outcome}; stopping because --stop-on is non-done`);
+        return {
+          status: result.status,
+          taskCount,
+          workflows,
+          outcomes,
+          error: result.error
+        };
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const failed = await failChainlinkWorkflow(workflow.id, message).catch(() => null);
       if (failed)
         workflows[workflows.length - 1] = failed;
-      return { status: "failed", taskCount, workflows, error: message };
+      const outcome = options.signal?.aborted ? "interrupted" : "crashed";
+      outcomes[task.id] = outcome;
+      await emit({
+        type: "task-outcome",
+        taskID: task.id,
+        outcome,
+        attempts: workflows[workflows.length - 1].attemptsUsed,
+        stopReason: message
+      });
+      return {
+        status: options.signal?.aborted ? "interrupted" : "failed",
+        taskCount,
+        workflows,
+        outcomes,
+        error: message
+      };
     }
   }
 }
@@ -1098,9 +1311,11 @@ function defaultProcessAlive(pid) {
     return false;
   }
 }
+function workspaceKey(cwd, dbPath) {
+  return `${cwd}::${dbPath ?? ""}`.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(-120);
+}
 function lockPathFor(cwd, dbPath) {
-  const key = `${cwd}::${dbPath ?? ""}`.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(-120);
-  return join2(tmpdir(), `chainlink-loop-${key}.lock`);
+  return join2(tmpdir(), `chainlink-loop-${workspaceKey(cwd, dbPath)}.lock`);
 }
 async function acquireLoopLock(cwd, dbPath, pid = process.pid, isProcessAlive = defaultProcessAlive) {
   const path = lockPathFor(cwd, dbPath);
@@ -1133,6 +1348,10 @@ async function acquireLoopLock(cwd, dbPath, pid = process.pid, isProcessAlive = 
   throw new Error(`could not acquire the Chainlink loop lock at ${path}`);
 }
 
+// src/chainlink-runs.ts
+import { mkdir as mkdir3, readdir, readFile as readFile3, rename as rename2, rm as rm2, stat, writeFile as writeFile2 } from "fs/promises";
+import { dirname as dirname3, join as join3 } from "path";
+
 // src/version.ts
 var PLUGIN_NAME = "@prevalentware/opencode-loop-plugin";
 function readString(value) {
@@ -1142,9 +1361,9 @@ var injectedVersion = readString("0.3.1");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-45-g42dd1ca"),
-  gitSha: readString("42dd1ca"),
-  gitDirty: false,
+  gitDescribe: readString("v0.1.8-46-g512af70"),
+  gitSha: readString("512af70"),
+  gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
 function formatBuildInfo(info = BUILD_INFO) {
@@ -1155,6 +1374,303 @@ function formatBuildInfo(info = BUILD_INFO) {
   else if (info.source === "dev")
     parts.push("(dev)");
   return parts.join(" ");
+}
+
+// src/chainlink-runs.ts
+var RUN_HEARTBEAT_MS = 15000;
+var RUN_HEARTBEAT_STALE_MS = RUN_HEARTBEAT_MS * 3;
+var MAX_RUN_RECORDS = 50;
+function runsDirectory() {
+  return join3(dirname3(statePath()), "chainlink-runs");
+}
+function runRecordPath(runId) {
+  return join3(runsDirectory(), `${runId}.json`);
+}
+function generateRunID(now = Date.now()) {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let suffix = "";
+  for (let index = 0;index < 8; index += 1) {
+    suffix += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return `run_${now.toString(36)}_${suffix}`;
+}
+async function atomicWrite(file, data) {
+  await mkdir3(dirname3(file), { recursive: true, mode: 448 });
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  await writeFile2(tmp, data, { mode: 384 });
+  await rename2(tmp, file);
+}
+function iso(timestamp) {
+  return new Date(timestamp).toISOString();
+}
+function taskFor(record, taskID) {
+  let task = record.tasks.find((candidate) => candidate.id === taskID);
+  if (!task) {
+    task = {
+      id: taskID,
+      title: taskID,
+      status: "pending",
+      outcome: null,
+      attempts: 0,
+      maxAttempts: 0,
+      baseSha: null,
+      verify: null,
+      startedAt: null,
+      endedAt: null,
+      stopReason: null
+    };
+    record.tasks.push(task);
+  }
+  return task;
+}
+
+class ChainlinkRunRecorder {
+  runId;
+  path;
+  heartbeatIntervalMs;
+  clock;
+  recordValue;
+  timer;
+  writeQueue = Promise.resolve();
+  finished = false;
+  constructor(options, runId, path, record) {
+    this.runId = runId;
+    this.path = path;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? RUN_HEARTBEAT_MS;
+    this.clock = options.now ?? Date.now;
+    this.recordValue = record;
+  }
+  static async start(options) {
+    const clock = options.now ?? Date.now;
+    const timestamp = clock();
+    const runId = options.runId ?? generateRunID(timestamp);
+    const path = runRecordPath(runId);
+    const record = {
+      version: 1,
+      runId,
+      pid: options.pid ?? process.pid,
+      cwd: options.cwd,
+      chainlinkDb: options.dbPath,
+      argv: [...options.argv],
+      build: options.build ?? BUILD_INFO,
+      startedAt: iso(timestamp),
+      heartbeatAt: iso(timestamp),
+      updatedAt: iso(timestamp),
+      current: { taskID: null, attempt: null, step: "selecting", since: iso(timestamp) },
+      tasks: (options.plannedTaskIds ?? []).map((id) => ({
+        id,
+        title: id,
+        status: "pending",
+        outcome: null,
+        attempts: 0,
+        maxAttempts: 0,
+        baseSha: null,
+        verify: null,
+        startedAt: null,
+        endedAt: null,
+        stopReason: null
+      })),
+      status: "running",
+      exitCode: null,
+      endedAt: null,
+      result: null
+    };
+    const recorder = new ChainlinkRunRecorder(options, runId, path, record);
+    await recorder.persist();
+    recorder.startHeartbeat();
+    await pruneRunRecords();
+    return recorder;
+  }
+  snapshot() {
+    return JSON.parse(JSON.stringify(this.recordValue));
+  }
+  startHeartbeat() {
+    if (this.heartbeatIntervalMs <= 0)
+      return;
+    this.timer = setInterval(() => {
+      this.heartbeat().catch(() => {
+        return;
+      });
+    }, this.heartbeatIntervalMs);
+    this.timer.unref?.();
+  }
+  persist() {
+    const data = `${JSON.stringify(this.recordValue, null, 2)}
+`;
+    const file = this.path;
+    const write = () => atomicWrite(file, data);
+    this.writeQueue = this.writeQueue.then(write, write);
+    return this.writeQueue;
+  }
+  async update(mutator) {
+    if (this.finished)
+      return this.snapshot();
+    mutator(this.recordValue);
+    this.recordValue.updatedAt = iso(this.clock());
+    await this.persist();
+    return this.snapshot();
+  }
+  async heartbeat() {
+    if (this.finished)
+      return this.snapshot();
+    const timestamp = this.clock();
+    this.recordValue.heartbeatAt = iso(timestamp);
+    this.recordValue.updatedAt = iso(timestamp);
+    await this.persist();
+    return this.snapshot();
+  }
+  async setCurrent(current) {
+    return this.update((record) => {
+      record.current = current ? { ...current, since: iso(this.clock()) } : null;
+    });
+  }
+  async taskStarted(taskID, title, baseSha, maxAttempts) {
+    return this.update((record) => {
+      const task = taskFor(record, taskID);
+      task.title = title;
+      task.status = "running";
+      task.baseSha = baseSha;
+      task.maxAttempts = maxAttempts;
+      task.startedAt = iso(this.clock());
+      task.endedAt = null;
+      task.stopReason = null;
+      record.current = { taskID, attempt: 0, step: "worker", since: iso(this.clock()) };
+    });
+  }
+  async step(taskID, attempt, step) {
+    return this.update((record) => {
+      const task = taskFor(record, taskID);
+      task.status = "running";
+      task.attempts = Math.max(task.attempts, attempt);
+      record.current = { taskID, attempt, step, since: iso(this.clock()) };
+    });
+  }
+  async taskOutcome(taskID, outcome, details) {
+    return this.update((record) => {
+      const task = taskFor(record, taskID);
+      task.status = "finished";
+      task.outcome = outcome;
+      task.attempts = Math.max(task.attempts, details.attempts);
+      task.verify = details.verify ?? task.verify;
+      task.endedAt = iso(this.clock());
+      task.stopReason = details.stopReason ?? null;
+      if (record.current?.taskID === taskID)
+        record.current = null;
+    });
+  }
+  async finish(status, exitCode, result = null) {
+    if (this.finished)
+      return this.snapshot();
+    this.finished = true;
+    if (this.timer)
+      clearInterval(this.timer);
+    this.timer = undefined;
+    const timestamp = this.clock();
+    this.recordValue.status = status;
+    this.recordValue.exitCode = exitCode;
+    this.recordValue.endedAt = iso(timestamp);
+    this.recordValue.heartbeatAt = iso(timestamp);
+    this.recordValue.updatedAt = iso(timestamp);
+    this.recordValue.current = null;
+    this.recordValue.result = result ?? runResultSummary(this.recordValue, this.path);
+    await this.persist();
+    await pruneRunRecords();
+    return this.snapshot();
+  }
+  dispose() {
+    this.finished = true;
+    if (this.timer)
+      clearInterval(this.timer);
+    this.timer = undefined;
+  }
+}
+async function pruneRunRecords(keep = MAX_RUN_RECORDS) {
+  if (keep < 1)
+    return;
+  let names;
+  try {
+    names = await readdir(runsDirectory());
+  } catch {
+    return;
+  }
+  const files = await Promise.all(names.map(async (name) => {
+    const path = join3(runsDirectory(), name);
+    try {
+      const info = await stat(path);
+      return { name, path, mtimeMs: info.mtimeMs };
+    } catch {
+      return null;
+    }
+  }));
+  const present = files.filter((file) => file !== null);
+  const recordNames = new Set(present.filter((file) => file.name.endsWith(".json")).map((file) => file.name));
+  const ordered = present.filter((file) => file.name.endsWith(".json")).sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const remove = ordered.slice(keep);
+  for (const file of remove) {
+    await rm2(file.path, { force: true });
+    const logName = `${file.name.slice(0, -".json".length)}.log`;
+    if (!recordNames.has(logName))
+      await rm2(join3(runsDirectory(), logName), { force: true });
+  }
+}
+function defaultProcessAlive2(pid) {
+  if (!Number.isInteger(pid) || pid <= 0)
+    return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function runIsDone(record) {
+  return record.tasks.every((task) => task.outcome === "done");
+}
+function deriveRunState(record, options = {}) {
+  const now = options.now ?? Date.now();
+  const isProcessAlive = options.isProcessAlive ?? defaultProcessAlive2;
+  const heartbeatAgeMs = Math.max(0, now - Date.parse(record.heartbeatAt));
+  const stale = heartbeatAgeMs > (options.staleMs ?? RUN_HEARTBEAT_STALE_MS);
+  const alive = isProcessAlive(record.pid);
+  if (record.status === "running") {
+    return { state: !alive || stale ? "dead" : "running", alive, heartbeatAgeMs, stale };
+  }
+  if (record.status === "completed" || record.status === "capped") {
+    return {
+      state: runIsDone(record) ? "done" : "not-done",
+      alive,
+      heartbeatAgeMs,
+      stale
+    };
+  }
+  return { state: record.status, alive, heartbeatAgeMs, stale };
+}
+function runExitCode(record) {
+  const { state } = deriveRunState(record);
+  return state === "done" || state === "idle" ? 0 : 1;
+}
+function runResultSummary(record, path) {
+  const { state } = deriveRunState(record);
+  return {
+    run: record.runId,
+    record: path,
+    status: record.status,
+    state,
+    exitCode: record.exitCode ?? runExitCode(record),
+    cwd: record.cwd,
+    chainlinkDb: record.chainlinkDb,
+    startedAt: record.startedAt,
+    endedAt: record.endedAt,
+    current: record.current,
+    tasks: record.tasks.map((task) => ({
+      id: task.id,
+      title: task.title,
+      attempts: task.attempts,
+      outcome: task.outcome,
+      verify: task.verify ? { command: task.verify.command, exitCode: task.verify.exitCode, passed: task.verify.passed } : null
+    })),
+    outcomes: Object.fromEntries(record.tasks.map((task) => [task.id, task.outcome]))
+  };
 }
 
 // src/chainlink-cli.ts
@@ -1228,7 +1744,8 @@ function parseArgs(argv) {
     customPrompt: process.env.CHAINLINK_PROMPT ?? null,
     dryRun: false,
     version: false,
-    help: false
+    help: false,
+    runId: null
   };
   for (let i = 0;i < argv.length; i += 1) {
     const arg = argv[i];
@@ -1302,6 +1819,9 @@ function parseArgs(argv) {
         break;
       case "--dry-run":
         parsed.dryRun = true;
+        break;
+      case "--run-id":
+        parsed.runId = next();
         break;
       default:
         throw new Error(`unknown option ${arg}`);
@@ -1377,6 +1897,7 @@ ${USAGE}`);
     return 0;
   }
   const cwd = process.cwd();
+  const dbPath = process.env.CHAINLINK_DB ?? null;
   const ownerSessionID = `chainlink-cli-${process.pid}`;
   const log = (line) => process.stdout.write(`[chainlink] ${line}
 `);
@@ -1396,7 +1917,7 @@ ${USAGE}`);
     step,
     runner: execChainlinkCommand,
     log,
-    dbPath: process.env.CHAINLINK_DB ?? null
+    dbPath
   });
   if (parsed.dryRun) {
     log(`cwd: ${cwd}`);
@@ -1414,12 +1935,44 @@ ${USAGE}`);
     }
     return 0;
   }
+  const recorder = await ChainlinkRunRecorder.start({
+    runId: parsed.runId ?? generateRunID(),
+    cwd,
+    dbPath,
+    argv,
+    plannedTaskIds: parsed.taskIds ?? undefined
+  });
+  log(`run: ${recorder.runId}`);
+  log(`record: ${recorder.path}`);
+  options.onRunEvent = async (event) => {
+    if (event.type === "task-started") {
+      await recorder.taskStarted(event.taskID, event.title, event.baseSha, event.maxAttempts);
+    } else if (event.type === "step") {
+      await recorder.step(event.taskID, event.attempt, event.step);
+    } else {
+      await recorder.taskOutcome(event.taskID, event.outcome, {
+        attempts: event.attempts,
+        verify: event.verify,
+        stopReason: event.stopReason
+      });
+    }
+  };
   const controller = new AbortController;
   let signalled = false;
+  let lock = null;
   const onSignal = (signal) => {
     if (signalled) {
       log(`${signal} again, exiting now`);
-      process.exit(130);
+      (async () => {
+        try {
+          await recorder.finish("interrupted", 130);
+        } catch {}
+        try {
+          await lock?.release();
+        } catch {}
+        process.exit(130);
+      })();
+      return;
     }
     signalled = true;
     log(`${signal} received, finishing the current step and stopping`);
@@ -1427,21 +1980,32 @@ ${USAGE}`);
   };
   process.on("SIGINT", () => onSignal("SIGINT"));
   process.on("SIGTERM", () => onSignal("SIGTERM"));
+  process.on("SIGHUP", () => onSignal("SIGHUP"));
   options.signal = controller.signal;
-  let lock;
   try {
     lock = await acquireLoopLock(cwd, options.dbPath);
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}
 `);
+    await recorder.finish("failed", 2);
     return 2;
   }
   log(`lock: ${lock.path}`);
   let report;
   try {
     report = await runProcessLoop(options);
-  } finally {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const exitCode = 1;
     await lock.release();
+    lock = null;
+    await recorder.finish("failed", exitCode);
+    log(`error: ${message}`);
+    log(`RESULT ${JSON.stringify(recorder.snapshot().result)}`);
+    return exitCode;
+  } finally {
+    if (lock)
+      await lock.release();
   }
   log(`status: ${report.status} after ${report.taskCount} task(s)`);
   for (const workflow of report.workflows) {
@@ -1449,7 +2013,12 @@ ${USAGE}`);
   }
   if (report.error)
     log(`error: ${report.error}`);
-  return report.status === "failed" || report.status === "interrupted" ? 1 : 0;
+  const status = report.status;
+  const exitCode = report.status === "failed" || report.status === "interrupted" || report.status === "exhausted" ? 1 : 0;
+  await recorder.finish(status, exitCode);
+  const final = runResultSummary(recorder.snapshot(), recorder.path);
+  log(`RESULT ${JSON.stringify(final)}`);
+  return final.exitCode;
 }
 var invokedDirectly = process.argv[1]?.includes("chainlink-cli");
 if (invokedDirectly) {

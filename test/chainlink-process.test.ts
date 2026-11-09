@@ -53,6 +53,7 @@ test("buildProcessLoopOptions wires the logger through to the loop", () => {
     dryRun: false,
     version: false,
     help: false,
+    runId: null,
   }
   const step = async () => ({ sessionID: null, text: "", exitCode: 0, timedOut: false, startupTimedOut: false, aborted: false, durationMs: 0, stderr: "", pid: null })
   const runner = async () => ({ stdout: "", stderr: "" })
