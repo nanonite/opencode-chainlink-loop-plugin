@@ -501,6 +501,7 @@ export function runResultSummary(record: ChainlinkRunRecord, path: string) {
         : null,
     })),
     outcomes: Object.fromEntries(record.tasks.map((task) => [task.id, task.outcome])),
+    table: formatRunTable(record),
   }
 }
 

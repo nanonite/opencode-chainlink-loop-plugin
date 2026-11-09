@@ -53,6 +53,7 @@ test("status reports a dead run when its pid is gone and gives the exact relaunc
   expect(info.state).toBe("dead")
   expect(info.record).toBe(runRecordPath("run_dead_pid"))
   expect(info.relaunch).toContain("chainlink-loop")
+  expect(info.relaunch).toContain("--resume run_dead_pid")
   expect(info.relaunch).toContain("--task 86")
   expect(info.relaunch).toContain("--review-first always")
 })

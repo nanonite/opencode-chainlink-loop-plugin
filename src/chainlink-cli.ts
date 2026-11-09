@@ -55,6 +55,12 @@ export type ChainlinkCliArguments = {
   attempts: number
   maxTasks: number | null
   closeOnApproval: boolean
+  /** Close only a done task whose --verify passed; otherwise leave it open. */
+  closeIfVerified: boolean
+  /** Halt the queue at the first task whose outcome is not done (default). */
+  stopOnNonDone: boolean
+  /** Pick up the remaining tasks from this run record. */
+  resumeRunId: string | null
   reviewFirst: "auto" | "always" | "never"
   excludeIDs: string[]
   workerModel: string | null
@@ -89,6 +95,13 @@ Options:
   --attempts <n>      Per-task worker/reviewer attempt limit (default 20).
   --max-tasks <n>     Stop after this many tasks.
   --no-close          Leave approved issues open (default is to close them).
+  --close-if-verified Close an issue only when the outcome is done and --verify
+                      passed; otherwise it stays open.
+  --stop-on <mode>    non-done | never. Default non-done: halt at the first task
+                      whose deterministic outcome is not done. never keeps the
+                      old skip-and-continue behaviour.
+  --resume <runId>    Resume the remaining tasks from a run record (status shows
+                      the exact command for a dead run).
   --review-first <m>  auto | always | never (default auto: review work already in
                       the tree before dispatching a fresh worker).
   --exclude <ids>     Comma-separated issue ids whose subtrees the queue must not
@@ -132,6 +145,9 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
     attempts: 20,
     maxTasks: null,
     closeOnApproval: true,
+    closeIfVerified: false,
+    stopOnNonDone: true,
+    resumeRunId: null,
     reviewFirst: "auto",
     excludeIDs: (process.env.CHAINLINK_EXCLUDE ?? "")
       .split(",")
@@ -188,6 +204,19 @@ function parseArgs(argv: string[]): ChainlinkCliArguments {
         break
       case "--close":
         parsed.closeOnApproval = true
+        break
+      case "--close-if-verified":
+        parsed.closeIfVerified = true
+        break
+      case "--stop-on": {
+        const value = next()
+        if (value === "non-done") parsed.stopOnNonDone = true
+        else if (value === "never") parsed.stopOnNonDone = false
+        else throw new Error("--stop-on must be non-done or never")
+        break
+      }
+      case "--resume":
+        parsed.resumeRunId = next()
         break
       case "--review-first":
         parsed.reviewFirst = next() as ChainlinkCliArguments["reviewFirst"]
@@ -297,6 +326,8 @@ export function buildProcessLoopOptions(input: BuildProcessLoopOptionsInput): Pr
     verifyCommand: input.parsed.verifyCommand,
     verifyTimeoutSeconds: 600,
     closeOnApproval: input.parsed.closeOnApproval,
+    closeIfVerified: input.parsed.closeIfVerified,
+    stopOnNonDone: input.parsed.stopOnNonDone,
     reviewFirst: input.parsed.reviewFirst,
     excludeIDs: input.parsed.excludeIDs,
     customPrompt: input.parsed.customPrompt,
@@ -340,18 +371,28 @@ export function relaunchCommand(record: ChainlinkRunRecord) {
   const args: string[] = []
   for (let index = 0; index < record.argv.length; index += 1) {
     const arg = record.argv[index]!
-    if (arg === "--run-id") {
-      index += 1
-      continue
-    }
-    if (arg === "--review-first") {
+    if (arg === "--run-id" || arg === "--review-first" || arg === "--resume") {
       index += 1
       continue
     }
     args.push(arg)
   }
   args.push("--review-first", "always")
-  return ["chainlink-loop", ...args].map(shellQuote).join(" ")
+  return ["chainlink-loop", "--resume", record.runId, ...args].map(shellQuote).join(" ")
+}
+
+/**
+ * What a resumed run should pick up. An explicit task list keeps its order and
+ * drops already-done tasks; queue mode keeps selecting new tasks but never
+ * revisits a task this run already finished.
+ */
+export function planResume(
+  record: ChainlinkRunRecord,
+  explicitTasks: boolean,
+): { taskIds: string[] | null; skipTaskIDs: string[] } {
+  const remaining = record.tasks.filter((task) => task.outcome !== "done").map((task) => task.id)
+  if (explicitTasks) return { taskIds: remaining, skipTaskIDs: [] }
+  return { taskIds: null, skipTaskIDs: record.tasks.filter((task) => task.outcome === "done").map((task) => task.id) }
 }
 
 function statusExitCode(state: string) {
@@ -575,16 +616,30 @@ export async function main(argv: string[]) {
     dbPath,
   })
 
+  if (parsed.resumeRunId) {
+    const lookup = await findRunRecord({ runId: parsed.resumeRunId, cwd, dbPath })
+    if (!lookup) {
+      process.stderr.write(`no Chainlink run record found with id "${parsed.resumeRunId}"\n`)
+      return 2
+    }
+    const explicitTasks =
+      parsed.taskIds != null || lookup.record.argv.some((arg) => arg === "--task" || arg === "--tasks")
+    const plan = planResume(lookup.record, explicitTasks)
+    options.taskIds = plan.taskIds
+    options.skipTaskIDs = plan.skipTaskIDs
+    log(`resume: ${lookup.record.runId} from ${lookup.path}`)
+  }
+
   if (parsed.dryRun) {
     log(`cwd: ${cwd}`)
-    log(`tasks: ${parsed.taskIds?.join(", ") ?? "(queue)"}`)
+    log(`tasks: ${options.taskIds?.join(", ") ?? "(queue)"}`)
     log(`attempts: ${parsed.attempts}, close on approval: ${parsed.closeOnApproval}, review-first: ${parsed.reviewFirst}`)
     if (parsed.excludeIDs.length) log(`excluded subtrees: ${parsed.excludeIDs.join(", ")}`)
     if (parsed.customPrompt) log(`direction: ${parsed.customPrompt}`)
-    if (parsed.taskIds?.length === 1) {
-      const show = await execChainlinkCommand(["issue", "show", "--json", parsed.taskIds[0]!.replace(/^#/, "")], cwd, options.dbPath)
+    if (options.taskIds?.length === 1) {
+      const show = await execChainlinkCommand(["issue", "show", "--json", options.taskIds[0]!.replace(/^#/, "")], cwd, options.dbPath)
       const task = parseJSON(show.stdout) as Record<string, unknown>
-      const detection = await detectExistingWork(cwd, { id: parsed.taskIds[0]!.replace(/^#/, ""), title: "", ...task })
+      const detection = await detectExistingWork(cwd, { id: options.taskIds[0]!.replace(/^#/, ""), title: "", ...task })
       log(`existing work: ${detection.existing ? `yes — ${detection.reason} (will review first)` : `no — ${detection.reason}`}`)
     }
     return 0
@@ -595,7 +650,7 @@ export async function main(argv: string[]) {
     cwd,
     dbPath,
     argv,
-    plannedTaskIds: parsed.taskIds ?? undefined,
+    plannedTaskIds: options.taskIds ?? undefined,
   })
   log(`run: ${recorder.runId}`)
   log(`record: ${recorder.path}`)
@@ -673,6 +728,8 @@ export async function main(argv: string[]) {
   for (const workflow of report.workflows) {
     log(`  #${workflow.taskID} ${workflow.status} (${workflow.attemptsUsed} attempt(s)) ${workflow.stopReason ?? ""}`.trimEnd())
   }
+  log("summary:")
+  for (const line of formatRunTable(recorder.snapshot())) log(line)
   if (report.error) log(`error: ${report.error}`)
 
   const status = report.status as ChainlinkRunStatus

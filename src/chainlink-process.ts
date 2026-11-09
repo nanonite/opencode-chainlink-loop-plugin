@@ -812,7 +812,7 @@ export async function runProcessLoop(options: ProcessLoopOptions): Promise<Proce
   const seen = new Set<string>()
   const exhausted = new Set<string>()
   const skip = new Set((options.skipTaskIDs ?? []).map((id) => id.replace(/^#/, "")))
-  const requested = options.taskIds?.length ? [...new Set(normalizeTaskIds(options.taskIds))] : null
+  const requested = options.taskIds != null ? [...new Set(normalizeTaskIds(options.taskIds))] : null
   let index = 0
   let taskCount = 0
   let sawExhausted = false

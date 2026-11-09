@@ -1176,7 +1176,7 @@ async function runProcessLoop(options) {
   const seen = new Set;
   const exhausted = new Set;
   const skip = new Set((options.skipTaskIDs ?? []).map((id) => id.replace(/^#/, "")));
-  const requested = options.taskIds?.length ? [...new Set(normalizeTaskIds(options.taskIds))] : null;
+  const requested = options.taskIds != null ? [...new Set(normalizeTaskIds(options.taskIds))] : null;
   let index = 0;
   let taskCount = 0;
   let sawExhausted = false;
@@ -1365,8 +1365,8 @@ var injectedVersion = readString("0.3.1");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-48-gb49cb39"),
-  gitSha: readString("b49cb39"),
+  gitDescribe: readString("v0.1.8-49-g3a80c0c"),
+  gitSha: readString("3a80c0c"),
   gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
@@ -1712,7 +1712,8 @@ function runResultSummary(record, path) {
       outcome: task.outcome,
       verify: task.verify ? { command: task.verify.command, exitCode: task.verify.exitCode, passed: task.verify.passed } : null
     })),
-    outcomes: Object.fromEntries(record.tasks.map((task) => [task.id, task.outcome]))
+    outcomes: Object.fromEntries(record.tasks.map((task) => [task.id, task.outcome])),
+    table: formatRunTable(record)
   };
 }
 function formatRunTable(record) {
@@ -1742,6 +1743,13 @@ Options:
   --attempts <n>      Per-task worker/reviewer attempt limit (default 20).
   --max-tasks <n>     Stop after this many tasks.
   --no-close          Leave approved issues open (default is to close them).
+  --close-if-verified Close an issue only when the outcome is done and --verify
+                      passed; otherwise it stays open.
+  --stop-on <mode>    non-done | never. Default non-done: halt at the first task
+                      whose deterministic outcome is not done. never keeps the
+                      old skip-and-continue behaviour.
+  --resume <runId>    Resume the remaining tasks from a run record (status shows
+                      the exact command for a dead run).
   --review-first <m>  auto | always | never (default auto: review work already in
                       the tree before dispatching a fresh worker).
   --exclude <ids>     Comma-separated issue ids whose subtrees the queue must not
@@ -1784,6 +1792,9 @@ function parseArgs(argv) {
     attempts: 20,
     maxTasks: null,
     closeOnApproval: true,
+    closeIfVerified: false,
+    stopOnNonDone: true,
+    resumeRunId: null,
     reviewFirst: "auto",
     excludeIDs: (process.env.CHAINLINK_EXCLUDE ?? "").split(",").map((value) => value.trim()).filter(Boolean),
     workerModel: process.env.CHAINLINK_WORKER_MODEL ?? null,
@@ -1835,6 +1846,22 @@ function parseArgs(argv) {
         break;
       case "--close":
         parsed.closeOnApproval = true;
+        break;
+      case "--close-if-verified":
+        parsed.closeIfVerified = true;
+        break;
+      case "--stop-on": {
+        const value = next();
+        if (value === "non-done")
+          parsed.stopOnNonDone = true;
+        else if (value === "never")
+          parsed.stopOnNonDone = false;
+        else
+          throw new Error("--stop-on must be non-done or never");
+        break;
+      }
+      case "--resume":
+        parsed.resumeRunId = next();
         break;
       case "--review-first":
         parsed.reviewFirst = next();
@@ -1925,6 +1952,8 @@ function buildProcessLoopOptions(input) {
     verifyCommand: input.parsed.verifyCommand,
     verifyTimeoutSeconds: 600,
     closeOnApproval: input.parsed.closeOnApproval,
+    closeIfVerified: input.parsed.closeIfVerified,
+    stopOnNonDone: input.parsed.stopOnNonDone,
     reviewFirst: input.parsed.reviewFirst,
     excludeIDs: input.parsed.excludeIDs,
     customPrompt: input.parsed.customPrompt,
@@ -1958,18 +1987,20 @@ function relaunchCommand(record) {
   const args = [];
   for (let index = 0;index < record.argv.length; index += 1) {
     const arg = record.argv[index];
-    if (arg === "--run-id") {
-      index += 1;
-      continue;
-    }
-    if (arg === "--review-first") {
+    if (arg === "--run-id" || arg === "--review-first" || arg === "--resume") {
       index += 1;
       continue;
     }
     args.push(arg);
   }
   args.push("--review-first", "always");
-  return ["chainlink-loop", ...args].map(shellQuote).join(" ");
+  return ["chainlink-loop", "--resume", record.runId, ...args].map(shellQuote).join(" ");
+}
+function planResume(record, explicitTasks) {
+  const remaining = record.tasks.filter((task) => task.outcome !== "done").map((task) => task.id);
+  if (explicitTasks)
+    return { taskIds: remaining, skipTaskIDs: [] };
+  return { taskIds: null, skipTaskIDs: record.tasks.filter((task) => task.outcome === "done").map((task) => task.id) };
 }
 function statusExitCode(state) {
   return state === "running" || state === "done" || state === "idle" ? 0 : 1;
@@ -2182,18 +2213,31 @@ ${USAGE}`);
     log,
     dbPath
   });
+  if (parsed.resumeRunId) {
+    const lookup = await findRunRecord({ runId: parsed.resumeRunId, cwd, dbPath });
+    if (!lookup) {
+      process.stderr.write(`no Chainlink run record found with id "${parsed.resumeRunId}"
+`);
+      return 2;
+    }
+    const explicitTasks = parsed.taskIds != null || lookup.record.argv.some((arg) => arg === "--task" || arg === "--tasks");
+    const plan = planResume(lookup.record, explicitTasks);
+    options.taskIds = plan.taskIds;
+    options.skipTaskIDs = plan.skipTaskIDs;
+    log(`resume: ${lookup.record.runId} from ${lookup.path}`);
+  }
   if (parsed.dryRun) {
     log(`cwd: ${cwd}`);
-    log(`tasks: ${parsed.taskIds?.join(", ") ?? "(queue)"}`);
+    log(`tasks: ${options.taskIds?.join(", ") ?? "(queue)"}`);
     log(`attempts: ${parsed.attempts}, close on approval: ${parsed.closeOnApproval}, review-first: ${parsed.reviewFirst}`);
     if (parsed.excludeIDs.length)
       log(`excluded subtrees: ${parsed.excludeIDs.join(", ")}`);
     if (parsed.customPrompt)
       log(`direction: ${parsed.customPrompt}`);
-    if (parsed.taskIds?.length === 1) {
-      const show = await execChainlinkCommand(["issue", "show", "--json", parsed.taskIds[0].replace(/^#/, "")], cwd, options.dbPath);
+    if (options.taskIds?.length === 1) {
+      const show = await execChainlinkCommand(["issue", "show", "--json", options.taskIds[0].replace(/^#/, "")], cwd, options.dbPath);
       const task = parseJSON2(show.stdout);
-      const detection = await detectExistingWork(cwd, { id: parsed.taskIds[0].replace(/^#/, ""), title: "", ...task });
+      const detection = await detectExistingWork(cwd, { id: options.taskIds[0].replace(/^#/, ""), title: "", ...task });
       log(`existing work: ${detection.existing ? `yes \u2014 ${detection.reason} (will review first)` : `no \u2014 ${detection.reason}`}`);
     }
     return 0;
@@ -2203,7 +2247,7 @@ ${USAGE}`);
     cwd,
     dbPath,
     argv,
-    plannedTaskIds: parsed.taskIds ?? undefined
+    plannedTaskIds: options.taskIds ?? undefined
   });
   log(`run: ${recorder.runId}`);
   log(`record: ${recorder.path}`);
@@ -2274,6 +2318,9 @@ ${USAGE}`);
   for (const workflow of report.workflows) {
     log(`  #${workflow.taskID} ${workflow.status} (${workflow.attemptsUsed} attempt(s)) ${workflow.stopReason ?? ""}`.trimEnd());
   }
+  log("summary:");
+  for (const line of formatRunTable(recorder.snapshot()))
+    log(line);
   if (report.error)
     log(`error: ${report.error}`);
   const status = report.status;
@@ -2294,6 +2341,7 @@ export {
   collectStepOutput,
   main,
   opencodeRunArgs,
+  planResume,
   relaunchCommand,
   startCommand,
   statusCommand,
