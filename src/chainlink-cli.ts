@@ -436,6 +436,7 @@ export async function statusCommand(argv: string[], context: CliCommandContext =
   const derived = deriveRunState(lookup.record, { isProcessAlive: ctx.isProcessAlive })
   const info = {
     ...runResultSummary(lookup.record, lookup.path),
+    state: derived.state,
     pid: lookup.record.pid,
     heartbeatAt: lookup.record.heartbeatAt,
     heartbeatAgeMs: derived.heartbeatAgeMs,
@@ -504,12 +505,12 @@ export async function waitCommand(argv: string[], context: CliCommandContext = {
     if (lookup) {
       const derived = deriveRunState(lookup.record, { isProcessAlive: ctx.isProcessAlive })
       if (derived.state !== "running") {
-        const result = { ...runResultSummary(lookup.record, lookup.path), wait: "finished" }
+        const result = { ...runResultSummary(lookup.record, lookup.path), state: derived.state, wait: "finished" }
         ctx.stdout(`[chainlink] RESULT ${JSON.stringify(result)}`)
         return runExitCode(lookup.record)
       }
       if (Date.now() >= deadline) {
-        const result = { ...runResultSummary(lookup.record, lookup.path), wait: "timeout" }
+        const result = { ...runResultSummary(lookup.record, lookup.path), state: derived.state, wait: "timeout" }
         ctx.stdout(`[chainlink] RESULT ${JSON.stringify(result)}`)
         return 3
       }
@@ -708,6 +709,7 @@ export async function main(argv: string[]) {
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     await recorder.finish("failed", 2)
+    log(`RESULT ${JSON.stringify(recorder.snapshot().result)}`)
     return 2
   }
   log(`lock: ${lock.path}`)
