@@ -30,7 +30,13 @@ _Avoid_: daemon, worker
 Work on one Chainlink issue, including worker attempts, reviewer decisions, and optional issue closure after approval. A workflow ends on approval, attempt exhaustion, failure, cancellation, or interruption.
 
 **Chainlink Outer Loop**:
-Selection of successive actionable Chainlink issues. It stops when the queue is empty or the configured task cap is reached.
+Selection of successive actionable Chainlink issues. It stops when the queue is empty, the configured task cap is reached, or the default stop-on policy halts at a non-done outcome.
+
+**Chainlink Run Record**:
+The durable, atomic record of one CLI run: run id, pid, workspace, build, heartbeat, current step, per-task outcomes, final status and exit code. `status` and `wait` read it; a run with no final status and a gone pid or stale heartbeat is `dead` and names its exact relaunch command.
+
+**Task Outcome**:
+The deterministic verdict for one issue: `done`, `approved-no-changes`, `approved-but-escalated`, `verify-failed`, `exhausted`, `crashed`, or `interrupted`. Reviewer approval is necessary but never sufficient for `done`; new commits since the task base sha and a passing `--verify` (when configured) are required.
 
 **Operator Direction**:
 Free-form guidance supplied when a Chainlink run starts (`--prompt` on the CLI, `custom_prompt` for the `/chainlink` tool). It is layered above each issue's notes and applied by both the worker and the reviewer without editing the issues.
@@ -43,6 +49,8 @@ _Avoid_: system prompt, override
 - The `/loop` slash command is the user entrypoint; the loop tools are the agent entrypoint; both mutate the same persisted state owned by the server plugin.
 - `chainlink-loop` is the standalone and only entrypoint for a **Chainlink Outer Loop**; the former in-server `/chainlink` command and `run_chainlink_outer` tool were removed (see AGENTS.md).
 - A **Chainlink Outer Loop** runs one **Chainlink Workflow** per selected issue. Each workflow uses worker and reviewer attempts, rather than scheduler iterations.
+- Each **Chainlink Outer Loop** run owns one **Chainlink Run Record**; `wait` and `status` read that record rather than the log.
+- A **Task Outcome** is computed from commits, the issue's escalation/blocked state, and the acceptance command, never from reviewer approval alone.
 - An **Operator Direction** applies to every **Chainlink Workflow** in a run, so the worker scopes to it and the reviewer verifies it.
 
 ## Flagged Ambiguities

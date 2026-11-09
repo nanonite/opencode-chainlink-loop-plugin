@@ -88,7 +88,10 @@ export type ChainlinkCliArguments = {
 const USAGE = `chainlink-loop — deterministic Chainlink outer/inner loop (no LLM in the control path)
 
 Usage:
-  chainlink-loop [options]
+  chainlink-loop [options]                 run in the foreground
+  chainlink-loop start --detach [options]  start in the background
+  chainlink-loop wait [--run <id>] [--timeout <s>]
+  chainlink-loop status [--run <id>] [--json]
 
 Options:
   --task <ids>        Comma-separated issue ids, e.g. 67 or 67,71. "#67" is accepted.
@@ -733,11 +736,12 @@ export async function main(argv: string[]) {
   if (report.error) log(`error: ${report.error}`)
 
   const status = report.status as ChainlinkRunStatus
+  const hasOutcomes = Object.keys(report.outcomes).length > 0
   const allDone = Object.values(report.outcomes).every((outcome) => outcome === "done")
   const exitCode =
     report.status === "failed" || report.status === "interrupted" || report.status === "exhausted"
       ? 1
-      : report.status === "idle" || allDone
+      : !hasOutcomes || allDone
         ? 0
         : 1
   await recorder.finish(status, exitCode)

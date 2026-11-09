@@ -112,6 +112,48 @@ The published package includes the `chainlink-loop` executable. Install it with 
 
 `chainlink-loop` runs the whole outer/inner loop with **no LLM in the control path**. Code picks the issue, counts the attempts and decides when to stop. Every step is a one-shot `opencode run` process, so each one has its own `--auto` permissions, its own agent, an exit code and a killable process tree.
 
+#### Runbook: start, wait, status
+
+Run these from the project root. They need no ids, record paths or state paths: the CLI resolves the newest run for the current working directory and `CHAINLINK_DB`.
+
+```bash
+# Start one issue in the background.
+chainlink-loop start --detach --task 67
+
+# Block until it is done, dead or finished without a done outcome.
+chainlink-loop wait
+
+# Inspect the same run at any time.
+chainlink-loop status
+chainlink-loop status --json
+```
+
+`start --detach` prints the run id, log path and record path as its only stdout. `wait` prints the final `RESULT` JSON and maps its exit code from the outcome:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | The run is done: every task outcome is `done`. |
+| `1` | Failed, dead, exhausted, or finished with a non-done outcome. |
+| `3` | `wait --timeout` expired before the run reached a verdict. |
+
+`status` reports `running`, `done`, `not-done`, `dead`, `failed`, `exhausted` or `interrupted`. A run is `dead` when it has no final status and either its pid is gone or its heartbeat is more than three intervals stale. `status` then prints the exact relaunch command, which resumes the remaining tasks from the run record.
+
+#### Outcomes
+
+Reviewer approval alone is never `done`. The CLI classifies each task from deterministic facts:
+
+| Outcome | Meaning |
+| --- | --- |
+| `done` | Reviewer approved, new commits exist since the task's base sha, the issue is not escalated, and `--verify` passed when configured. |
+| `approved-no-changes` | Reviewer approved but no new commits were made since the task started. |
+| `approved-but-escalated` | Reviewer approved but the issue gained an escalation comment or a blocked flag. |
+| `verify-failed` | The `--verify` command exited non-zero; its output tail became findings for the next worker attempt. |
+| `exhausted` | The attempt limit was reached without a done outcome. |
+| `crashed` | A worker or reviewer step died before delivering a result. |
+| `interrupted` | The operator sent SIGINT, SIGTERM or SIGHUP. |
+
+The end of a run prints a task/attempts/outcome/verify table, and the same table is stored in the run record. By default the queue halts at the first task whose outcome is not `done`; use `--stop-on never` to keep the old skip-and-continue behaviour.
+
 ```bash
 # drain the queue
 chainlink-loop
@@ -134,6 +176,10 @@ bun run src/chainlink-cli.ts --task 67 --dry-run
 | `--attempts <n>` | Per-task attempt limit (default 20). |
 | `--max-tasks <n>` | Stop after this many tasks. |
 | `--no-close` | Leave approved issues open. Default is to close them. |
+| `--close-if-verified` | Close an issue only when its outcome is `done` and `--verify` passed; otherwise leave it open. |
+| `--stop-on non-done\|never` | Halt at the first non-done outcome (default), or keep skipping and continuing (`never`). |
+| `--resume <runId>` | Resume the remaining tasks from a run record. `status` prints the exact command for a dead run. |
+| `--verify <cmd>` | Acceptance command run in the worktree after reviewer approval. Exit 0 is required for `done`; a failure is fed back to the worker as findings. |
 | `--review-first auto\|always\|never` | Review work that already exists before dispatching a fresh worker (default `auto`). |
 | `--exclude <ids>` | Skip these issue subtrees when selecting ready tasks after an exhausted issue. |
 | `--prompt <text>` | Operator direction layered above each task's notes. Both the worker and the reviewer follow it, so a run can be scoped without editing the issues. Also settable via `CHAINLINK_PROMPT`; `--prompt` wins. |
@@ -154,7 +200,7 @@ The loop per task:
 
 `--review-first auto` looks for a dirty tree, commits that mention the issue, a previous Chainlink workflow for the same task, or comments on the issue. If any are found, the reviewer runs **first** so a previous attempt's work is judged rather than thrown away.
 
-**One loop per workspace.** The loop takes a lock keyed by working directory and `CHAINLINK_DB` (`$TMPDIR/chainlink-loop-*.lock`) so a second invocation fails loudly instead of dispatching two workers at the same files. A lock whose owning process is gone is taken over automatically. `SIGINT`/`SIGTERM` stop the loop, kill the in-flight step's process group, and release the lock; a second signal exits immediately.
+**One loop per workspace.** The loop takes a lock keyed by working directory and `CHAINLINK_DB` (`$TMPDIR/chainlink-loop-*.lock`) so a second invocation fails loudly instead of dispatching two workers at the same files. A lock whose owning process is gone is taken over automatically. `SIGINT`/`SIGTERM`/`SIGHUP` stop the loop, kill the in-flight step's process group, write a terminal `interrupted` run record, and release the lock; a second signal exits immediately.
 
 **Exhausted tasks are skipped, not fatal.** A task that burns its attempt limit is left open for a human and the loop moves on to the next ready leaf. Because `issue next` keeps returning the same still-open task, the loop falls back to `issue ready --json` and picks the first leaf it has not touched. That fallback does **not** know about a project which deliberately holds a subtree back, so use `--exclude <ids>` for those — for example `--exclude 1` to keep the queue out of a "upstream reports" epic whose children wait on a human.
 
@@ -246,6 +292,8 @@ If `XDG_DATA_HOME` is not set, the default is:
 The versioned filename isolates this plugin from older loop-plugin processes that use `loops.json` and do not understand Chainlink workflows.
 
 Set `OPENCODE_LOOP_STATE_PATH` to use a custom file.
+
+Each Chainlink CLI run also writes a durable run record next to the loop state; the CLI prints the record path at start and in its `RESULT` line, and `status --json` always includes it.
 
 The state file is written atomically with owner-only permissions when the host filesystem supports it. Active interval loops are rehydrated and rescheduled when OpenCode restarts. Dynamic loops that were waiting on the agent to schedule their next run cannot recover on their own after a restart and are stopped with an explanatory reason. Chainlink workflows are marked `interrupted` on restart rather than blindly repeating worker actions.
 

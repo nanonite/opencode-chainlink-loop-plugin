@@ -1365,8 +1365,8 @@ var injectedVersion = readString("0.3.1");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-49-g3a80c0c"),
-  gitSha: readString("3a80c0c"),
+  gitDescribe: readString("v0.1.8-50-g7aed96d"),
+  gitSha: readString("7aed96d"),
   gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
@@ -1686,6 +1686,14 @@ function deriveRunState(record, options = {}) {
       stale
     };
   }
+  if (record.status === "idle") {
+    return {
+      state: record.tasks.length === 0 ? "idle" : runIsDone(record) ? "done" : "not-done",
+      alive,
+      heartbeatAgeMs,
+      stale
+    };
+  }
   return { state: record.status, alive, heartbeatAgeMs, stale };
 }
 function runExitCode(record) {
@@ -1736,7 +1744,10 @@ function parseJSON2(text) {
 var USAGE = `chainlink-loop \u2014 deterministic Chainlink outer/inner loop (no LLM in the control path)
 
 Usage:
-  chainlink-loop [options]
+  chainlink-loop [options]                 run in the foreground
+  chainlink-loop start --detach [options]  start in the background
+  chainlink-loop wait [--run <id>] [--timeout <s>]
+  chainlink-loop status [--run <id>] [--json]
 
 Options:
   --task <ids>        Comma-separated issue ids, e.g. 67 or 67,71. "#67" is accepted.
@@ -2324,8 +2335,9 @@ ${USAGE}`);
   if (report.error)
     log(`error: ${report.error}`);
   const status = report.status;
+  const hasOutcomes = Object.keys(report.outcomes).length > 0;
   const allDone = Object.values(report.outcomes).every((outcome) => outcome === "done");
-  const exitCode = report.status === "failed" || report.status === "interrupted" || report.status === "exhausted" ? 1 : report.status === "idle" || allDone ? 0 : 1;
+  const exitCode = report.status === "failed" || report.status === "interrupted" || report.status === "exhausted" ? 1 : !hasOutcomes || allDone ? 0 : 1;
   await recorder.finish(status, exitCode);
   const final = runResultSummary(recorder.snapshot(), recorder.path);
   log(`RESULT ${JSON.stringify(final)}`);

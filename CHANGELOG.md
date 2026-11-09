@@ -10,6 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Remove the deprecated in-server child-session Chainlink engine (`/chainlink`, `run_chainlink_outer`, the `chainlink_*` plugin options, and `src/chainlink.ts`); the `chainlink-loop` CLI is the only engine, and `check:engine` now scans `src/` and `test/` in full (#10)
 
 ### Added
+- Add durable Chainlink run records with a heartbeat, atomic writes, per-task outcomes and a final `RESULT` line (#11)
+- Add `chainlink-loop status`, `wait` and `start --detach`, with dead-run detection and an exact relaunch command (#12)
+- Classify task outcomes from commits, escalation state and `--verify`, so reviewer approval alone is never `done` (#13)
+- Add `--stop-on`, `--close-if-verified`, the end-of-run outcome table and resume from a run record (#14)
+- Add the start/wait/status runbook, outcome and exit-code tables, and the run-record vocabulary (#15)
 - Log the build identity at the start of every `chainlink-loop` run, so a detached log names the version it executed
 - Add a Chainlink Engine Rule and a `check:engine` pre-commit guard: one CLI engine, no MCP, and no in-server child-session engine
 - Add local checkout loading for OpenCode 2 (#1)
@@ -24,4 +29,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix extractReview discarding genuine reviewer approvals when prose with brackets precedes the JSON verdict (#4)
 
 ### Changed
+- Treat SIGHUP like SIGTERM: finish the step, write an `interrupted` record and release the lock (#12)
+- Halt a multi-issue run at the first non-done outcome by default; `--stop-on never` keeps the old skip-and-continue policy (#14)
 - Publish the plugin under a controlled npm scope and recheck upstream install fixes (#3)

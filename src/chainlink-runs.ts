@@ -470,6 +470,14 @@ export function deriveRunState(
       stale,
     }
   }
+  if (record.status === "idle") {
+    return {
+      state: record.tasks.length === 0 ? "idle" : runIsDone(record) ? "done" : "not-done",
+      alive,
+      heartbeatAgeMs,
+      stale,
+    }
+  }
   return { state: record.status, alive, heartbeatAgeMs, stale }
 }
 

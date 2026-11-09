@@ -148,6 +148,32 @@ test("wait exits 1 when the run finished but its outcome is not done", async () 
   expect(line).toContain('"state":"not-done"')
 })
 
+test("an idle queue that finished with a non-done task still exits 1 and reports not-done", async () => {
+  const recorder = await startRecord("run_idle_not_done")
+  await recorder.taskOutcome("86", "approved-no-changes", { attempts: 1 })
+  await recorder.finish("idle", 0)
+  const output = capture()
+
+  const waitCode = await waitCommand(["--timeout", "1"], {
+    cwd: dir,
+    dbPath: null,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    pollMs: 20,
+  })
+  const statusCode = await statusCommand(["--json"], {
+    cwd: dir,
+    dbPath: null,
+    stdout: output.stdout,
+    stderr: output.stderr,
+  })
+
+  expect(waitCode).toBe(1)
+  expect(statusCode).toBe(1)
+  const info = JSON.parse(output.lines.at(-1)!)
+  expect(info.state).toBe("not-done")
+})
+
 test("wait exits 3 on timeout and leaves the run running", async () => {
   const recorder = await startRecord("run_wait_timeout")
   recorder.dispose()
