@@ -138,6 +138,8 @@ chainlink-loop status --json
 
 `status` reports `running`, `done`, `not-done`, `dead`, `failed`, `exhausted` or `interrupted`. A run is `dead` when it has no final status and either its pid is gone or its heartbeat is more than three intervals stale. `status` then prints the exact relaunch command, which resumes the remaining tasks from the run record.
 
+`status` also cross-checks every task id in the record with Chainlink (`issue show --json <id>`, honouring `CHAINLINK_DB`) and adds a per-task `tracker` state: `open`, `closed` or `unknown`. The lookup is read-only and best-effort: a missing `chainlink`, an unreachable database or an unknown id only makes that row `unknown`. When a terminal run that is not `done` has all of its tasks closed in Chainlink, `status` prints `note: all N task(s) are closed in Chainlink; this record predates their acceptance` and `status --json` sets `trackerResolved: true`. The run's own state, exit code and `wait` result do not change, so a stale record is easy to tell apart from a live failure.
+
 #### Outcomes
 
 Reviewer approval alone is never `done`. The CLI classifies each task from deterministic facts:

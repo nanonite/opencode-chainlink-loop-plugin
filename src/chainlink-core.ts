@@ -20,10 +20,16 @@ export type ChainlinkModelRef = {
   variant?: string
 }
 
+export type ChainlinkCommandOptions = {
+  /** Optional per-call timeout override; the loop keeps its 10s default. */
+  timeoutMs?: number
+}
+
 export type ChainlinkCommandRunner = (
   args: readonly string[],
   cwd: string,
   dbPath?: string | null,
+  options?: ChainlinkCommandOptions,
 ) => Promise<ChainlinkCommandResult>
 
 /** The subset of run options the task-selection and close helpers need. */
@@ -62,7 +68,7 @@ export type ChainlinkReview = {
   nextAction: string
 }
 
-export const execChainlinkCommand: ChainlinkCommandRunner = (args, cwd, dbPath) =>
+export const execChainlinkCommand: ChainlinkCommandRunner = (args, cwd, dbPath, options) =>
   new Promise((resolve, reject) => {
     execFile(
       "chainlink",
@@ -70,7 +76,7 @@ export const execChainlinkCommand: ChainlinkCommandRunner = (args, cwd, dbPath) 
       {
         cwd,
         encoding: "utf8",
-        timeout: 10_000,
+        timeout: options?.timeoutMs ?? 10_000,
         maxBuffer: 1_000_000,
         windowsHide: true,
         env: dbPath ? { ...process.env, CHAINLINK_DB: dbPath } : process.env,

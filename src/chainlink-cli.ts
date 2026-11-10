@@ -351,6 +351,8 @@ export type CliCommandContext = {
   stderr?: (line: string) => void
   pollMs?: number
   isProcessAlive?: (pid: number) => boolean
+  /** Injected for tests; the CLI uses execChainlinkCommand. */
+  runner?: ChainlinkCommandRunner
 }
 
 function commandContext(context: CliCommandContext = {}) {
@@ -361,6 +363,7 @@ function commandContext(context: CliCommandContext = {}) {
     stderr: context.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)),
     pollMs: context.pollMs ?? 1000,
     isProcessAlive: context.isProcessAlive,
+    runner: context.runner ?? execChainlinkCommand,
   }
 }
 
@@ -402,6 +405,81 @@ function statusExitCode(state: string) {
   return state === "running" || state === "done" || state === "idle" ? 0 : 1
 }
 
+export type RunTrackerState = "open" | "closed" | "unknown"
+
+/** Status lookups are best-effort: cap each call so an unreachable DB cannot stall status. */
+const TRACKER_LOOKUP_TIMEOUT_MS = 2_000
+
+function trackerStateFromShowOutput(output: string): RunTrackerState {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(output)
+  } catch {
+    return "unknown"
+  }
+  if (typeof parsed !== "object" || parsed === null) return "unknown"
+  const record = parsed as Record<string, unknown>
+  const candidate =
+    typeof record.data === "object" && record.data !== null ? (record.data as Record<string, unknown>) : record
+  return candidate.status === "open" || candidate.status === "closed" ? candidate.status : "unknown"
+}
+
+async function lookupTrackerState(
+  taskID: string,
+  runner: ChainlinkCommandRunner,
+  cwd: string,
+  dbPath: string | null,
+): Promise<RunTrackerState> {
+  if (!/^[A-Za-z0-9._:-]+$/.test(taskID)) return "unknown"
+  // Bound the whole lookup at the status layer too, so a runner that ignores
+  // its own timeout (or a hung child) still cannot stall status.
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (state: RunTrackerState) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(state)
+    }
+    const timer = setTimeout(() => finish("unknown"), TRACKER_LOOKUP_TIMEOUT_MS)
+    runner(["issue", "show", "--json", taskID], cwd, dbPath, { timeoutMs: TRACKER_LOOKUP_TIMEOUT_MS }).then(
+      (show) => finish(trackerStateFromShowOutput(show.stdout)),
+      () => finish("unknown"),
+    )
+  })
+}
+
+/**
+ * Cross-checks the record's task ids with the tracker using the same
+ * `issue show --json` invocation the loop uses. Every lookup is independent, so
+ * one missing id, a missing `chainlink` binary, or an unreachable database only
+ * makes that row `unknown`; lookups run in parallel and never throw.
+ */
+async function lookupTrackerStates(
+  record: ChainlinkRunRecord,
+  runner: ChainlinkCommandRunner,
+  cwd: string,
+  dbPath: string | null,
+): Promise<Map<string, RunTrackerState>> {
+  const entries = await Promise.all(
+    record.tasks.map(async (task): Promise<[string, RunTrackerState]> => [
+      task.id,
+      await lookupTrackerState(task.id, runner, cwd, dbPath),
+    ]),
+  )
+  return new Map(entries)
+}
+
+/** The status table keeps the record table intact and appends the tracker column. */
+function formatStatusTable(record: ChainlinkRunRecord, tracker: ReadonlyMap<string, RunTrackerState>) {
+  const lines = formatRunTable(record)
+  lines[0] = `${lines[0]}  tracker`
+  record.tasks.forEach((task, index) => {
+    lines[index + 1] = `${lines[index + 1]}  ${tracker.get(task.id) ?? "unknown"}`
+  })
+  return lines
+}
+
 export async function statusCommand(argv: string[], context: CliCommandContext = {}): Promise<number> {
   const ctx = commandContext(context)
   let runId: string | null = null
@@ -434,8 +512,22 @@ export async function statusCommand(argv: string[], context: CliCommandContext =
     return 1
   }
   const derived = deriveRunState(lookup.record, { isProcessAlive: ctx.isProcessAlive })
+  const tracker = await lookupTrackerStates(
+    lookup.record,
+    ctx.runner,
+    lookup.record.cwd,
+    ctx.dbPath ?? lookup.record.chainlinkDb,
+  )
+  const terminalNotDone = ["failed", "not-done", "exhausted", "interrupted", "dead"].includes(derived.state)
+  const trackerResolved =
+    terminalNotDone &&
+    lookup.record.tasks.length > 0 &&
+    lookup.record.tasks.every((task) => tracker.get(task.id) === "closed")
+  const summary = runResultSummary(lookup.record, lookup.path)
   const info = {
-    ...runResultSummary(lookup.record, lookup.path),
+    ...summary,
+    tasks: summary.tasks.map((task) => ({ ...task, tracker: tracker.get(task.id) ?? "unknown" })),
+    table: formatStatusTable(lookup.record, tracker),
     state: derived.state,
     pid: lookup.record.pid,
     heartbeatAt: lookup.record.heartbeatAt,
@@ -444,6 +536,7 @@ export async function statusCommand(argv: string[], context: CliCommandContext =
     alive: derived.alive,
     selection: lookup.selection,
     candidates: lookup.candidates,
+    trackerResolved,
     ...(derived.state === "dead" ? { relaunch: relaunchCommand(lookup.record) } : {}),
   }
   if (json) {
@@ -462,7 +555,12 @@ export async function statusCommand(argv: string[], context: CliCommandContext =
         `current: task ${lookup.record.current.taskID ?? "?"} attempt ${lookup.record.current.attempt ?? "?"} ${lookup.record.current.step ?? ""}`.trimEnd(),
       )
     }
-    for (const line of formatRunTable(lookup.record)) ctx.stdout(line)
+    for (const line of info.table) ctx.stdout(line)
+    if (trackerResolved) {
+      ctx.stdout(
+        `note: all ${lookup.record.tasks.length} task(s) are closed in Chainlink; this record predates their acceptance`,
+      )
+    }
     if (derived.state === "dead") ctx.stdout(`relaunch: ${relaunchCommand(lookup.record)}`)
   }
   return statusExitCode(derived.state)

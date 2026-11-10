@@ -360,11 +360,11 @@ function normalizeTaskIds(raw) {
     return trimmed;
   });
 }
-var execChainlinkCommand = (args, cwd, dbPath) => new Promise((resolve, reject) => {
+var execChainlinkCommand = (args, cwd, dbPath, options) => new Promise((resolve, reject) => {
   execFile("chainlink", [...args], {
     cwd,
     encoding: "utf8",
-    timeout: 1e4,
+    timeout: options?.timeoutMs ?? 1e4,
     maxBuffer: 1e6,
     windowsHide: true,
     env: dbPath ? { ...process.env, CHAINLINK_DB: dbPath } : process.env
@@ -741,8 +741,8 @@ var injectedVersion = readString("0.3.1");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-55-gd6f10bd"),
-  gitSha: readString("d6f10bd"),
+  gitDescribe: readString("v0.1.8-56-g60d904b"),
+  gitSha: readString("60d904b"),
   gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
@@ -2005,7 +2005,8 @@ function commandContext(context = {}) {
     stderr: context.stderr ?? ((line) => process.stderr.write(`${line}
 `)),
     pollMs: context.pollMs ?? 1000,
-    isProcessAlive: context.isProcessAlive
+    isProcessAlive: context.isProcessAlive,
+    runner: context.runner ?? execChainlinkCommand
   };
 }
 function shellQuote(value) {
@@ -2035,6 +2036,51 @@ function planResume(record, explicitTasks) {
 function statusExitCode(state) {
   return state === "running" || state === "done" || state === "idle" ? 0 : 1;
 }
+var TRACKER_LOOKUP_TIMEOUT_MS = 2000;
+function trackerStateFromShowOutput(output) {
+  let parsed;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    return "unknown";
+  }
+  if (typeof parsed !== "object" || parsed === null)
+    return "unknown";
+  const record = parsed;
+  const candidate = typeof record.data === "object" && record.data !== null ? record.data : record;
+  return candidate.status === "open" || candidate.status === "closed" ? candidate.status : "unknown";
+}
+async function lookupTrackerState(taskID, runner, cwd, dbPath) {
+  if (!/^[A-Za-z0-9._:-]+$/.test(taskID))
+    return "unknown";
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (state) => {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(state);
+    };
+    const timer = setTimeout(() => finish("unknown"), TRACKER_LOOKUP_TIMEOUT_MS);
+    runner(["issue", "show", "--json", taskID], cwd, dbPath, { timeoutMs: TRACKER_LOOKUP_TIMEOUT_MS }).then((show) => finish(trackerStateFromShowOutput(show.stdout)), () => finish("unknown"));
+  });
+}
+async function lookupTrackerStates(record, runner, cwd, dbPath) {
+  const entries = await Promise.all(record.tasks.map(async (task) => [
+    task.id,
+    await lookupTrackerState(task.id, runner, cwd, dbPath)
+  ]));
+  return new Map(entries);
+}
+function formatStatusTable(record, tracker) {
+  const lines = formatRunTable(record);
+  lines[0] = `${lines[0]}  tracker`;
+  record.tasks.forEach((task, index) => {
+    lines[index + 1] = `${lines[index + 1]}  ${tracker.get(task.id) ?? "unknown"}`;
+  });
+  return lines;
+}
 async function statusCommand(argv, context = {}) {
   const ctx = commandContext(context);
   let runId = null;
@@ -2062,8 +2108,14 @@ async function statusCommand(argv, context = {}) {
     return 1;
   }
   const derived = deriveRunState(lookup.record, { isProcessAlive: ctx.isProcessAlive });
+  const tracker = await lookupTrackerStates(lookup.record, ctx.runner, lookup.record.cwd, ctx.dbPath ?? lookup.record.chainlinkDb);
+  const terminalNotDone = ["failed", "not-done", "exhausted", "interrupted", "dead"].includes(derived.state);
+  const trackerResolved = terminalNotDone && lookup.record.tasks.length > 0 && lookup.record.tasks.every((task) => tracker.get(task.id) === "closed");
+  const summary = runResultSummary(lookup.record, lookup.path);
   const info = {
-    ...runResultSummary(lookup.record, lookup.path),
+    ...summary,
+    tasks: summary.tasks.map((task) => ({ ...task, tracker: tracker.get(task.id) ?? "unknown" })),
+    table: formatStatusTable(lookup.record, tracker),
     state: derived.state,
     pid: lookup.record.pid,
     heartbeatAt: lookup.record.heartbeatAt,
@@ -2072,6 +2124,7 @@ async function statusCommand(argv, context = {}) {
     alive: derived.alive,
     selection: lookup.selection,
     candidates: lookup.candidates,
+    trackerResolved,
     ...derived.state === "dead" ? { relaunch: relaunchCommand(lookup.record) } : {}
   };
   if (json) {
@@ -2087,8 +2140,11 @@ async function statusCommand(argv, context = {}) {
     if (lookup.record.current) {
       ctx.stdout(`current: task ${lookup.record.current.taskID ?? "?"} attempt ${lookup.record.current.attempt ?? "?"} ${lookup.record.current.step ?? ""}`.trimEnd());
     }
-    for (const line of formatRunTable(lookup.record))
+    for (const line of info.table)
       ctx.stdout(line);
+    if (trackerResolved) {
+      ctx.stdout(`note: all ${lookup.record.tasks.length} task(s) are closed in Chainlink; this record predates their acceptance`);
+    }
     if (derived.state === "dead")
       ctx.stdout(`relaunch: ${relaunchCommand(lookup.record)}`);
   }

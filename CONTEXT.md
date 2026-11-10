@@ -35,6 +35,10 @@ Selection of successive actionable Chainlink issues. It stops when the queue is 
 **Chainlink Run Record**:
 The durable, atomic record of one CLI run: run id, pid, workspace, build, heartbeat, current step, per-task outcomes, final status and exit code. `status` and `wait` read it; a run with no final status and a gone pid or stale heartbeat is `dead` and names its exact relaunch command.
 
+**Tracker State**:
+The per-task answer `status` gets from Chainlink with `issue show --json <id>`: `open`, `closed`, or `unknown` when the lookup cannot answer (missing binary, unreachable database, or unknown id). It is read-only, bounded and never changes the run record, its state, exit code, or `wait` result. A terminal run that is not `done` whose tasks are all `closed` is marked `trackerResolved`.
+_Avoid_: verdict, accepted (the run record, not the tracker, owns the outcome)
+
 **Task Outcome**:
 The deterministic verdict for one issue: `done`, `approved-no-changes`, `approved-but-escalated`, `verify-failed`, `exhausted`, `crashed`, or `interrupted`. Reviewer approval is necessary but never sufficient for `done`; new commits since the task base sha (the prior run record's `baseSha` when resuming or reviewing existing work) and a passing `--verify` (when configured) are required. An ordinary `blocked_by` dependency is not an escalation; only an explicit blocked status/flag, a blocking/escalation label, a blocker/escalation comment kind, or a comment starting with `ESCALATION:` is.
 _Avoid_: approval, complete, green
@@ -51,6 +55,7 @@ _Avoid_: system prompt, override
 - `chainlink-loop` is the standalone and only entrypoint for a **Chainlink Outer Loop**; the former in-server `/chainlink` command and `run_chainlink_outer` tool were removed (see AGENTS.md).
 - A **Chainlink Outer Loop** runs one **Chainlink Workflow** per selected issue. Each workflow uses worker and reviewer attempts, rather than scheduler iterations.
 - Each **Chainlink Outer Loop** run owns one **Chainlink Run Record**; `wait` and `status` read that record rather than the log.
+- `status` adds a **Tracker State** per task without touching the **Chainlink Run Record**; a terminal non-done record whose tasks are all closed is annotated as `trackerResolved`, while its state, exit code and `wait` result stay unchanged.
 - A **Task Outcome** is computed from commits since the task base (including the recorded base from a prior run when resuming), the issue's explicit escalation/blocked state, and the acceptance command, never from reviewer approval alone or from a dependency link.
 - An **Operator Direction** applies to every **Chainlink Workflow** in a run, so the worker scopes to it and the reviewer verifies it.
 

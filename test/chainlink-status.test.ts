@@ -1,11 +1,19 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { spawn } from "node:child_process"
-import { ChainlinkRunRecorder, runRecordPath, runsDirectory } from "../src/chainlink-runs"
+import {
+  ChainlinkRunRecorder,
+  runRecordPath,
+  runsDirectory,
+  type ChainlinkRunStatus,
+  type ChainlinkTaskOutcome,
+} from "../src/chainlink-runs"
 import { lockPathFor } from "../src/chainlink-lock"
 import { statusCommand, waitCommand } from "../src/chainlink-cli"
+import type { ChainlinkCommandRunner } from "../src/chainlink-core"
 
 let dir = ""
 
@@ -192,6 +200,249 @@ test("wait exits 3 on timeout and leaves the run running", async () => {
   expect(line).toContain('"wait":"timeout"')
   const record = JSON.parse(await readFile(runRecordPath("run_wait_timeout"), "utf8"))
   expect(record.status).toBe("running")
+})
+
+async function finishRecord(
+  runId: string,
+  tasks: Array<{ id: string; outcome: ChainlinkTaskOutcome }>,
+  status: Exclude<ChainlinkRunStatus, "running"> = "failed",
+  options: { dbPath?: string | null } = {},
+) {
+  const recorder = await startRecord(runId, { dbPath: options.dbPath })
+  for (const task of tasks) {
+    await recorder.taskStarted(task.id, `Task ${task.id}`, null, 1)
+    await recorder.taskOutcome(task.id, task.outcome, { attempts: 1 })
+  }
+  await recorder.finish(status, status === "completed" ? 0 : 1)
+  recorder.dispose()
+  return recorder
+}
+
+type TrackerReply = "open" | "closed" | Error
+
+function fakeTracker(replies: Record<string, TrackerReply>, delayMs = 0) {
+  const calls: Array<{ args: string[]; cwd: string; dbPath?: string | null }> = []
+  let active = 0
+  let maxActive = 0
+  const runner: ChainlinkCommandRunner = async (args, cwd, dbPath) => {
+    calls.push({ args: [...args], cwd, dbPath })
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    try {
+      if (delayMs > 0) await Bun.sleep(delayMs)
+      const id = args.at(-1)!
+      const reply = replies[id]
+      if (reply instanceof Error) throw reply
+      if (reply == null) throw new Error(`Chainlink task ${id} was not found`)
+      return { stdout: JSON.stringify({ id, title: `Task ${id}`, status: reply }), stderr: "" }
+    } finally {
+      active -= 1
+    }
+  }
+  return { runner, calls, maxActive: () => maxActive }
+}
+
+test("status reports an open tracker state for a failed run and leaves it unresolved", async () => {
+  const dbPath = join(dir, "tracker.db")
+  await finishRecord("run_tracker_open", [{ id: "1", outcome: "exhausted" }], "failed", { dbPath })
+  const tracker = fakeTracker({ "1": "open" })
+  const output = capture()
+
+  const code = await statusCommand(["--json"], {
+    cwd: dir,
+    dbPath,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    runner: tracker.runner,
+  })
+
+  expect(code).toBe(1)
+  const info = JSON.parse(output.lines.join("\n"))
+  expect(info.state).toBe("failed")
+  expect(info.tasks).toEqual([expect.objectContaining({ id: "1", tracker: "open" })])
+  expect(info.trackerResolved).toBe(false)
+  expect(tracker.calls).toEqual([
+    { args: ["issue", "show", "--json", "1"], cwd: dir, dbPath },
+  ])
+})
+
+test("status shows a tracker column and annotates a failed run whose tasks are all closed", async () => {
+  await finishRecord(
+    "run_tracker_closed",
+    [
+      { id: "1", outcome: "approved-but-escalated" },
+      { id: "2", outcome: "exhausted" },
+    ],
+    "failed",
+  )
+  const tracker = fakeTracker({ "1": "closed", "2": "closed" })
+  const output = capture()
+
+  const code = await statusCommand([], {
+    cwd: dir,
+    dbPath: null,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    runner: tracker.runner,
+  })
+
+  expect(code).toBe(1)
+  expect(output.lines[0]).toContain("tracker")
+  expect(output.lines).toContain("note: all 2 task(s) are closed in Chainlink; this record predates their acceptance")
+  expect(output.lines.some((line) => /^#1\s+1\s+approved-but-escalated\s+not run\s+closed$/.test(line))).toBe(true)
+  expect(output.lines.some((line) => /^#2\s+1\s+exhausted\s+not run\s+closed$/.test(line))).toBe(true)
+
+  const json = capture()
+  const jsonCode = await statusCommand(["--json"], {
+    cwd: dir,
+    dbPath: null,
+    stdout: json.stdout,
+    stderr: json.stderr,
+    runner: tracker.runner,
+  })
+  expect(jsonCode).toBe(1)
+  const info = JSON.parse(json.lines.join("\n"))
+  expect(info.state).toBe("failed")
+  expect(info.trackerResolved).toBe(true)
+  expect(info.tasks.map((task: { tracker: string }) => task.tracker)).toEqual(["closed", "closed"])
+})
+
+test("status does not resolve a run with mixed open and closed tracker states", async () => {
+  await finishRecord(
+    "run_tracker_mixed",
+    [
+      { id: "1", outcome: "exhausted" },
+      { id: "2", outcome: "exhausted" },
+    ],
+    "exhausted",
+  )
+  const tracker = fakeTracker({ "1": "closed", "2": "open" })
+  const output = capture()
+
+  const code = await statusCommand(["--json"], {
+    cwd: dir,
+    dbPath: null,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    runner: tracker.runner,
+  })
+
+  expect(code).toBe(1)
+  const info = JSON.parse(output.lines.join("\n"))
+  expect(info.trackerResolved).toBe(false)
+  expect(info.tasks.map((task: { tracker: string }) => task.tracker)).toEqual(["closed", "open"])
+})
+
+test("status reports unknown for a task the tracker cannot answer and never resolves the run", async () => {
+  await finishRecord(
+    "run_tracker_unknown",
+    [
+      { id: "1", outcome: "exhausted" },
+      { id: "2", outcome: "exhausted" },
+    ],
+    "failed",
+  )
+  const tracker = fakeTracker({
+    "1": "closed",
+    "2": new Error("Chainlink task 2 was not found"),
+  })
+  const output = capture()
+
+  const code = await statusCommand(["--json"], {
+    cwd: dir,
+    dbPath: null,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    runner: tracker.runner,
+  })
+
+  expect(code).toBe(1)
+  const info = JSON.parse(output.lines.join("\n"))
+  expect(info.trackerResolved).toBe(false)
+  expect(info.tasks.map((task: { tracker: string }) => task.tracker)).toEqual(["closed", "unknown"])
+})
+
+test("status reports unknown when chainlink is missing and never fails", async () => {
+  await finishRecord("run_tracker_missing", [{ id: "1", outcome: "exhausted" }], "failed")
+  const missing = Object.assign(new Error("spawn chainlink ENOENT"), { code: "ENOENT" })
+  const tracker = fakeTracker({ "1": missing })
+  const output = capture()
+
+  const code = await statusCommand(["--json"], {
+    cwd: dir,
+    dbPath: null,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    runner: tracker.runner,
+  })
+
+  expect(code).toBe(1)
+  const info = JSON.parse(output.lines.join("\n"))
+  expect(info.state).toBe("failed")
+  expect(info.trackerResolved).toBe(false)
+  expect(info.tasks[0].tracker).toBe("unknown")
+})
+
+test("a running run is never annotated as resolved even when every task is closed", async () => {
+  const recorder = await startRecord("run_tracker_running")
+  await recorder.taskStarted("1", "Task 1", null, 1)
+  recorder.dispose()
+  const tracker = fakeTracker({ "1": "closed" })
+  const output = capture()
+
+  const code = await statusCommand(["--json"], {
+    cwd: dir,
+    dbPath: null,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    runner: tracker.runner,
+  })
+
+  expect(code).toBe(0)
+  const info = JSON.parse(output.lines.join("\n"))
+  expect(info.state).toBe("running")
+  expect(info.tasks[0].tracker).toBe("closed")
+  expect(info.trackerResolved).toBe(false)
+})
+
+test("status is read-only: the run record is byte-identical before and after", async () => {
+  await finishRecord("run_tracker_readonly", [{ id: "1", outcome: "exhausted" }], "failed")
+  const path = runRecordPath("run_tracker_readonly")
+  const hash = async () => createHash("sha256").update(await readFile(path)).digest("hex")
+  const before = await hash()
+  const tracker = fakeTracker({ "1": "closed" })
+  const output = capture()
+
+  await statusCommand(["--json"], {
+    cwd: dir,
+    dbPath: null,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    runner: tracker.runner,
+  })
+
+  expect(await hash()).toBe(before)
+})
+
+test("status looks up tracker states in parallel", async () => {
+  const ids = ["1", "2", "3", "4"]
+  await finishRecord(
+    "run_tracker_parallel",
+    ids.map((id) => ({ id, outcome: "exhausted" as ChainlinkTaskOutcome })),
+    "failed",
+  )
+  const tracker = fakeTracker(Object.fromEntries(ids.map((id) => [id, "closed"])), 40)
+  const output = capture()
+
+  await statusCommand(["--json"], {
+    cwd: dir,
+    dbPath: null,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    runner: tracker.runner,
+  })
+
+  expect(tracker.maxActive()).toBe(ids.length)
 })
 
 async function writeFakeBin(binDir: string) {

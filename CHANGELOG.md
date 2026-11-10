@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Classify task outcomes from commits, escalation state and `--verify`, so reviewer approval alone is never `done` (#13)
 - Add `--stop-on`, `--close-if-verified`, the end-of-run outcome table and resume from a run record (#14)
 - Add the start/wait/status runbook, outcome and exit-code tables, and the run-record vocabulary (#15)
+- Cross-check run-record task ids with Chainlink in `chainlink-loop status`, adding per-task `open`/`closed`/`unknown` tracker states and a `trackerResolved` note for terminal non-done runs whose tasks were later closed (#16)
 - Log the build identity at the start of every `chainlink-loop` run, so a detached log names the version it executed
 - Add a Chainlink Engine Rule and a `check:engine` pre-commit guard: one CLI engine, no MCP, and no in-server child-session engine
 - Add local checkout loading for OpenCode 2 (#1)
