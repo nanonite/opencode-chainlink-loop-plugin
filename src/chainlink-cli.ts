@@ -631,6 +631,7 @@ export async function main(argv: string[]) {
     const plan = planResume(lookup.record, explicitTasks)
     options.taskIds = plan.taskIds
     options.skipTaskIDs = plan.skipTaskIDs
+    options.resumeRecord = lookup.record
     log(`resume: ${lookup.record.runId} from ${lookup.path}`)
   }
 

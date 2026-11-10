@@ -2,6 +2,7 @@ import { spawn } from "node:child_process"
 import {
   boundedTaskJSON,
   closeTask,
+  ESCALATION_COMMENT_MARKER,
   escapeUntrustedText,
   extractReview,
   feedbackPrompt,
@@ -20,7 +21,13 @@ import {
   type ChainlinkTask,
   type ChainlinkWorkflowOptions,
 } from "./chainlink-core"
-import type { ChainlinkTaskOutcome, ChainlinkVerifyResult } from "./chainlink-runs"
+import {
+  listRunRecords,
+  type ChainlinkRunRecord,
+  type ChainlinkTaskOutcome,
+  type ChainlinkVerifyResult,
+} from "./chainlink-runs"
+import { workspaceKey } from "./chainlink-lock"
 import {
   createChainlinkWorkflow,
   failChainlinkWorkflow,
@@ -293,6 +300,11 @@ export type ProcessLoopOptions = {
   /** "auto" reviews first when the tree already holds work for this task. */
   reviewFirst: "auto" | "always" | "never"
   /**
+   * The run record being resumed (`--resume`). It supplies the task's prior
+   * baseSha, so commits made before the dead run stopped still count as work.
+   */
+  resumeRecord?: ChainlinkRunRecord | null
+  /**
    * Issue ids whose subtrees the queue fallback must not enter. `issue next`
    * already honours a workspace's intended chain, but the `issue ready`
    * fallback used to step past an exhausted task does not, so subtrees the
@@ -352,21 +364,48 @@ export async function gitCommitCountSince(cwd: string, baseSha: string | null): 
   return Number(raw)
 }
 
+/** The common ancestor of HEAD and `ref`, or null when git cannot answer. */
+export async function gitMergeBase(cwd: string, ref: string): Promise<string | null> {
+  const value = (await gitRunner(["merge-base", "HEAD", ref], cwd)).trim()
+  return /^[0-9a-f]{7,64}$/i.test(value) ? value : null
+}
+
 /**
- * Deterministic escalation signal on the issue itself: a blocked relationship or
- * flag, a blocking label, a blocker comment, or an explicit escalation comment.
+ * The merge-base with the repository's default branch. This is the fallback
+ * base for a task whose prior run record has no baseSha: commits already on a
+ * feature branch then still count as work done for the task.
+ */
+export async function gitDefaultBranchBase(cwd: string): Promise<string | null> {
+  for (const ref of ["refs/remotes/origin/HEAD", "origin/main", "origin/master", "main", "master", "trunk"]) {
+    const base = await gitMergeBase(cwd, ref)
+    if (base) return base
+  }
+  return null
+}
+
+/**
+ * Deterministic escalation signal on the issue itself: a blocked flag or status,
+ * a blocking/escalation label, a blocker or escalation comment kind, or a comment
+ * that starts with the explicit `ESCALATION:` marker.
+ *
+ * A dependency (`blocked_by`) is deliberately not a signal: Chainlink lists both
+ * open and closed blockers there, and an ordinary dependency is not an
+ * escalation. Authored prose is not a signal either, so "no escalation needed"
+ * cannot flag a task; only the marker at the start of a comment does.
  */
 export function taskIsEscalated(task: ChainlinkTask): boolean {
   if (task.blocked === true || task.status === "blocked") return true
-  if (Array.isArray(task.blocked_by) && task.blocked_by.length > 0) return true
   const labels = Array.isArray(task.labels) ? task.labels.map((label) => String(label)) : []
-  if (labels.some((label) => /^(blocked|escalat(?:ed|ion))$/i.test(label))) return true
+  if (labels.some((label) => /^(blocked|blocking|escalated|escalation)$/i.test(label))) return true
   const comments = Array.isArray(task.comments) ? task.comments : []
   return comments.some((comment) => {
     if (typeof comment !== "object" || comment === null) return false
     const record = comment as Record<string, unknown>
     if (typeof record.kind === "string" && /^(blocker|escalation)$/i.test(record.kind)) return true
-    return typeof record.content === "string" && /\bescalat(?:e|ed|ion)\b/i.test(record.content)
+    return (
+      typeof record.content === "string" &&
+      record.content.trimStart().toLowerCase().startsWith(ESCALATION_COMMENT_MARKER.toLowerCase())
+    )
   })
 }
 
@@ -506,6 +545,39 @@ export async function detectExistingWork(cwd: string, task: ChainlinkTask, prior
   return { existing: false, reason: "no prior work detected" }
 }
 
+/** The baseSha recorded for this task by a prior run, if it has one. */
+export function recordedBaseSha(record: ChainlinkRunRecord | null | undefined, taskID: string): string | null {
+  const task = record?.tasks.find((candidate) => candidate.id === taskID)
+  return task?.baseSha ?? null
+}
+
+/**
+ * Picks the sha that proves new work for this task.
+ *
+ * A fresh run starts from HEAD. A resumed or review-first run must not: the work
+ * that already exists was committed before this process started. In that case
+ * the task's recorded baseSha from its previous run record is the only sha that
+ * makes those commits countable; when no record has it, the merge-base with the
+ * default branch keeps commits on a feature branch visible. HEAD is the last
+ * resort so a repository with no default branch still behaves like before.
+ */
+export async function resolveTaskBaseSha(
+  options: ProcessLoopOptions,
+  task: ChainlinkTask,
+  usePriorWork: boolean,
+): Promise<string | null> {
+  if (!usePriorWork) return gitHead(options.cwd)
+  const prior = recordedBaseSha(options.resumeRecord, task.id)
+  if (prior) return prior
+  const key = workspaceKey(options.cwd, options.dbPath)
+  for (const { record } of await listRunRecords()) {
+    if (workspaceKey(record.cwd, record.chainlinkDb) !== key) continue
+    const base = recordedBaseSha(record, task.id)
+    if (base) return base
+  }
+  return (await gitDefaultBranchBase(options.cwd)) ?? (await gitHead(options.cwd))
+}
+
 /**
  * One line describing a review outcome. A parse failure is called out explicitly
  * so an operator can tell "the reviewer replied with prose we could not read"
@@ -547,7 +619,13 @@ export async function runProcessInnerLoop(
   let existingWork = false
   let pendingReview: ChainlinkReview | null = null
 
-  const baseSha = await gitHead(options.cwd)
+  const detection = await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID))
+  const reviewFirst = options.reviewFirst === "always" || (options.reviewFirst === "auto" && detection.existing)
+  const baseSha = await resolveTaskBaseSha(
+    options,
+    task,
+    detection.existing || reviewFirst || options.resumeRecord != null,
+  )
   const emit = async (event: ChainlinkRunEvent) => {
     try {
       await options.onRunEvent?.(event)
@@ -557,9 +635,6 @@ export async function runProcessInnerLoop(
     }
   }
   await emit({ type: "task-started", taskID: task.id, title: task.title, baseSha, maxAttempts: workflow.maxAttempts })
-
-  const detection = await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID))
-  const reviewFirst = options.reviewFirst === "always" || (options.reviewFirst === "auto" && detection.existing)
 
   const reviewerStepRetries = Math.max(0, options.reviewerStepRetries ?? 0)
   const startupRetries = Math.max(0, options.startupRetries ?? 0)

@@ -5,11 +5,13 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
   runProcessInnerLoop,
+  taskIsEscalated,
   type ProcessLoopOptions,
   type ProcessStepResult,
 } from "../src/chainlink-process"
+import { ChainlinkRunRecorder, type ChainlinkRunRecord } from "../src/chainlink-runs"
 import { createChainlinkWorkflow } from "../src/state"
-import type { ChainlinkTask } from "../src/chainlink-core"
+import { feedbackPrompt, reviewerPrompt, workerPrompt, type ChainlinkTask } from "../src/chainlink-core"
 
 let dir = ""
 
@@ -93,6 +95,41 @@ function commitWork(message = "work") {
   execFileSync("git", ["commit", "--allow-empty", "-m", message], { cwd: dir, stdio: "ignore" })
 }
 
+function headSha() {
+  return execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim()
+}
+
+async function priorRunRecord(baseSha: string): Promise<ChainlinkRunRecord> {
+  const recorder = await ChainlinkRunRecorder.start({
+    runId: "run_prior",
+    cwd: dir,
+    dbPath: null,
+    argv: ["--task", task.id],
+    plannedTaskIds: [task.id],
+    heartbeatIntervalMs: 0,
+  })
+  await recorder.taskStarted(task.id, task.title, baseSha, 2)
+  await recorder.taskOutcome(task.id, "interrupted", { attempts: 1 })
+  await recorder.finish("interrupted", 1)
+  const snapshot = recorder.snapshot()
+  recorder.dispose()
+  return snapshot
+}
+
+async function approveWith(
+  returnedTask: ChainlinkTask,
+  overrides: Partial<ProcessLoopOptions> = {},
+) {
+  const workflow = await workflowFor()
+  const runner = async () => ({ stdout: JSON.stringify(returnedTask), stderr: "" })
+  const step: ProcessLoopOptions["step"] = async (input) => {
+    if (input.agent === "plan") return stepResult({ text: approval })
+    commitWork()
+    return stepResult({ text: "committed the work" })
+  }
+  return runProcessInnerLoop(innerOptions(step, { runner, ...overrides }), workflow, task)
+}
+
 test("reviewer approval with no new commits is approved-no-changes, never done", async () => {
   const workflow = await workflowFor()
   const closes: string[][] = []
@@ -139,28 +176,156 @@ test("reviewer approval with a new commit is done and closes when configured", a
   expect(closes[0]).toContain("86")
 })
 
-test("an escalation or blocked flag on the issue is approved-but-escalated", async () => {
+test("an open blocked_by dependency is not an escalation and the task is done", async () => {
+  const dependent: ChainlinkTask = { ...task, blocked_by: [99] }
+  const result = await approveWith(dependent)
+  expect(result.outcome).toBe("done")
+})
+
+test("a closed blocked_by dependency is still listed on the issue but is not an escalation", async () => {
+  // `chainlink issue show` keeps closed dependencies in blocked_by too; neither
+  // an open nor a closed dependency is an escalation signal.
+  const dependent: ChainlinkTask = { ...task, blocked_by: [11, 12] }
+  const result = await approveWith(dependent)
+  expect(result.outcome).toBe("done")
+})
+
+test("a comment beginning with the ESCALATION: marker is approved-but-escalated", async () => {
+  const escalated: ChainlinkTask = {
+    ...task,
+    comments: [{ kind: "note", content: "ESCALATION: production credentials are unavailable" }],
+  }
+  const result = await approveWith(escalated)
+  expect(result.outcome).toBe("approved-but-escalated")
+})
+
+test("a blocker-kind comment is approved-but-escalated", async () => {
+  const escalated: ChainlinkTask = {
+    ...task,
+    comments: [{ kind: "blocker", content: "waiting for a human decision" }],
+  }
+  const result = await approveWith(escalated)
+  expect(result.outcome).toBe("approved-but-escalated")
+})
+
+test("a blocking label is approved-but-escalated", async () => {
+  const escalated: ChainlinkTask = { ...task, labels: ["blocked"] }
+  const result = await approveWith(escalated)
+  expect(result.outcome).toBe("approved-but-escalated")
+})
+
+test("a blocked status is approved-but-escalated", async () => {
+  const escalated: ChainlinkTask = { ...task, status: "blocked" }
+  const result = await approveWith(escalated)
+  expect(result.outcome).toBe("approved-but-escalated")
+})
+
+test("a note that merely mentions escalation without the marker is not an escalation", async () => {
+  const noteOnly: ChainlinkTask = {
+    ...task,
+    comments: [{ kind: "note", content: "no escalation needed for this change" }],
+  }
+  expect(taskIsEscalated(noteOnly)).toBe(false)
+  expect(
+    taskIsEscalated({
+      ...task,
+      comments: [{ kind: "note", content: "see the ESCALATION: note in the design doc" }],
+    }),
+  ).toBe(false)
+  const result = await approveWith(noteOnly)
+  expect(result.outcome).toBe("done")
+})
+
+test("worker and reviewer prompts use the same explicit escalation marker", async () => {
   const workflow = await workflowFor()
-  const escalated: ChainlinkTask = { ...task, blocked_by: [99] }
+  const review = { approved: false, summary: "needs work", findings: ["fix it"], nextAction: "fix it" }
+
+  expect(workerPrompt(workflow, task, 1)).toContain("ESCALATION:")
+  expect(reviewerPrompt(workflow, task, 1, "worker report")).toContain("ESCALATION:")
+  expect(feedbackPrompt(workflow, review)).toContain("ESCALATION:")
+})
+
+test("--resume with prior commits and reviewer approval is done and closes under --close-if-verified", async () => {
+  const baseSha = headSha()
+  const prior = await priorRunRecord(baseSha)
+  commitWork("work for #86 before the run died")
+
+  const workflow = await workflowFor()
   const closes: string[][] = []
   const runner = async (args: readonly string[]) => {
     if (args[0] === "issue" && args[1] === "close") closes.push([...args])
-    return { stdout: JSON.stringify(escalated), stderr: "" }
+    return { stdout: JSON.stringify(task), stderr: "" }
   }
   const step: ProcessLoopOptions["step"] = async (input) => {
     if (input.agent === "plan") return stepResult({ text: approval })
-    commitWork()
-    return stepResult({ text: "committed the work" })
+    throw new Error("the resume should review the existing commits before dispatching a worker")
   }
 
   const result = await runProcessInnerLoop(
-    innerOptions(step, { closeOnApproval: true, runner }),
+    innerOptions(step, {
+      runner,
+      resumeRecord: prior,
+      reviewFirst: "always",
+      closeOnApproval: true,
+      closeIfVerified: true,
+      verifyCommand: "exit 0",
+      verifyTimeoutSeconds: 5,
+    }),
     workflow,
     task,
   )
 
-  expect(result.outcome).toBe("approved-but-escalated")
-  expect(closes).toEqual([])
+  expect(result.outcome).toBe("done")
+  expect(result.verify?.passed).toBe(true)
+  expect(closes).toHaveLength(1)
+  expect(closes[0]).toContain("86")
+})
+
+test("--resume where nothing changed anywhere is approved-no-changes", async () => {
+  const baseSha = headSha()
+  const prior = await priorRunRecord(baseSha)
+
+  const workflow = await workflowFor()
+  const step: ProcessLoopOptions["step"] = async (input) => {
+    if (input.agent === "plan") return stepResult({ text: approval })
+    throw new Error("the resume should review first")
+  }
+
+  const result = await runProcessInnerLoop(
+    innerOptions(step, {
+      resumeRecord: prior,
+      reviewFirst: "always",
+    }),
+    workflow,
+    task,
+  )
+
+  expect(result.outcome).toBe("approved-no-changes")
+})
+
+test("review-first without a prior record counts commits since the default-branch merge-base", async () => {
+  const defaultBranch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+    cwd: dir,
+    encoding: "utf8",
+  }).trim()
+  execFileSync("git", ["checkout", "-b", "feature"], { cwd: dir, stdio: "ignore" })
+  commitWork("work for #86 on a branch")
+
+  const workflow = await workflowFor()
+  const runner = async () => ({ stdout: JSON.stringify(task), stderr: "" })
+  const step: ProcessLoopOptions["step"] = async (input) => {
+    if (input.agent === "plan") return stepResult({ text: approval })
+    throw new Error("review-first should not dispatch a worker")
+  }
+
+  const result = await runProcessInnerLoop(
+    innerOptions(step, { runner, reviewFirst: "always" }),
+    workflow,
+    task,
+  )
+
+  expect(defaultBranch).toBeTruthy()
+  expect(result.outcome).toBe("done")
 })
 
 test("a non-zero --verify is verify-failed and its output becomes the next worker's findings", async () => {
