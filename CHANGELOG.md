@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 - Fix outcome classification so an ordinary `blocked_by` dependency is not an escalation and only an explicit blocked flag/status, blocking label, blocker/escalation comment kind, or a comment starting with `ESCALATION:` flags a task (#13)
 - Fix resumed and review-first runs counting zero commits by taking the task base from the previous run record's `baseSha` (falling back to the default-branch merge-base), so prior commits reach `done` and can close under `--close-if-verified` (#13)
+- Cover `--resume` over pre-existing commits and tasks with an open dependency reaching `done` and closing under `--close-if-verified` at the backlog level (#14)
 - Fix the in-server `/chainlink` path treating `provider/model#variant` as a literal model id; effort variants now reach `Model.Ref.variant`, and a failed child session reports its real error instead of "returned no report" (#9)
 - Add a startup watchdog: a step that emits no output within `--startup-timeout` (default 300s) is killed and retried once, and a timeout logs the killed process group, exit code and stderr (#7)
 - Retry a crashed reviewer step instead of failing the whole run; a transient reviewer exit no longer abandons the rest of the queue (#8)

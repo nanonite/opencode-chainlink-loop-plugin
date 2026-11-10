@@ -542,8 +542,8 @@ var injectedVersion = readString("0.3.1");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-52-gde0875e"),
-  gitSha: readString("de0875e"),
+  gitDescribe: readString("v0.1.8-53-geda2419"),
+  gitSha: readString("eda2419"),
   gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };

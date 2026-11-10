@@ -215,3 +215,92 @@ test("--close-if-verified closes only a done task whose verify passed", async ()
   expect(result.outcome).toBe("done")
   expect(closes).toHaveLength(1)
 })
+
+async function initGitRepo() {
+  execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" })
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir })
+  execFileSync("git", ["config", "user.name", "Test"], { cwd: dir })
+  await writeFile(join(dir, "README.md"), "base\n")
+  execFileSync("git", ["add", "README.md"], { cwd: dir })
+  execFileSync("git", ["commit", "-m", "base"], { cwd: dir, stdio: "ignore" })
+}
+
+test("--resume over a task with pre-existing commits is done and closes under --close-if-verified", async () => {
+  await initGitRepo()
+  const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim()
+  const recorder = await ChainlinkRunRecorder.start({
+    runId: "run_resume_work",
+    cwd: dir,
+    dbPath: null,
+    argv: ["--task", "86"],
+    plannedTaskIds: ["86"],
+    heartbeatIntervalMs: 0,
+  })
+  await recorder.taskStarted("86", "Task 86", baseSha, 1)
+  await recorder.taskOutcome("86", "interrupted", { attempts: 1 })
+  await recorder.finish("interrupted", 1)
+  const prior = recorder.snapshot()
+  recorder.dispose()
+  execFileSync("git", ["commit", "--allow-empty", "-m", "work for #86"], { cwd: dir, stdio: "ignore" })
+
+  const plan = planResume(prior, true)
+  expect(plan.taskIds).toEqual(["86"])
+
+  const closes: string[][] = []
+  const runner = async (args: readonly string[]) => {
+    if (args[0] === "issue" && args[1] === "close") closes.push([...args])
+    return { stdout: JSON.stringify(task("86")), stderr: "" }
+  }
+  const step: ProcessLoopOptions["step"] = async (input) => {
+    if (input.agent === "plan") return stepResult({ text: approval })
+    throw new Error("the resumed task should review the pre-existing commits, not dispatch a worker")
+  }
+
+  const report = await runProcessLoop(
+    loopOptions(step, {
+      taskIds: plan.taskIds,
+      resumeRecord: prior,
+      reviewFirst: "always",
+      closeOnApproval: true,
+      closeIfVerified: true,
+      verifyCommand: "exit 0",
+      verifyTimeoutSeconds: 5,
+      runner,
+    }),
+  )
+
+  expect(report.outcomes["86"]).toBe("done")
+  expect(closes).toHaveLength(1)
+  expect(closes[0]).toContain("86")
+})
+
+test("an open blocked_by dependency is done and closes under --close-if-verified", async () => {
+  await initGitRepo()
+  const dependent: ChainlinkTask = { ...task("87"), blocked_by: [99] }
+  const closes: string[][] = []
+  const runner = async (args: readonly string[]) => {
+    if (args[0] === "issue" && args[1] === "close") closes.push([...args])
+    return { stdout: JSON.stringify(dependent), stderr: "" }
+  }
+  const step: ProcessLoopOptions["step"] = async (input) => {
+    if (input.agent === "plan") return stepResult({ text: approval })
+    execFileSync("git", ["commit", "--allow-empty", "-m", "work for #87"], { cwd: dir, stdio: "ignore" })
+    return stepResult({ text: "committed" })
+  }
+
+  const report = await runProcessLoop(
+    loopOptions(step, {
+      taskIds: ["87"],
+      reviewFirst: "never",
+      closeOnApproval: true,
+      closeIfVerified: true,
+      verifyCommand: "exit 0",
+      verifyTimeoutSeconds: 5,
+      runner,
+    }),
+  )
+
+  expect(report.outcomes["87"]).toBe("done")
+  expect(closes).toHaveLength(1)
+  expect(closes[0]).toContain("87")
+})
