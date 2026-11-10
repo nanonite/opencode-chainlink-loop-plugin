@@ -72,6 +72,110 @@ To test the CLI/TUI entrypoint locally, add the same checkout directory to the g
 
 OpenCode 2 loads a configured plugin directory through an `index.js`/`index.ts` entrypoint for the server and a `tui.tsx`/`tui.ts` entrypoint for the CLI, so keep the repository-root `index.js` and `tui.tsx` in place. Configured file paths are rejected and Git specifiers for packages with build scripts fail on OpenCode 2.0.16 (upstream opencode issues 49704 and 46551).
 
+### Chainlink outcome smoke (built CLI)
+
+Run this after `bun run build`. Use the built `bin/chainlink-loop`, a throwaway `CHAINLINK_DB`, a temp `OPENCODE_LOOP_STATE_PATH`, and fake `opencode` executables so no model is called.
+
+The fake `opencode` reads `--agent`; for `plan` it prints a `--format json` text event whose text is the approval JSON, and for `build` it commits `work.txt`. Extra modes make the other cases reproducible: `noop` reports without a commit, `escalate` adds `chainlink issue comment <id> "ESCALATION: ..."` before committing, `hang` commits and then sleeps, and `review-only` never commits. Save this as `$ROOT/bin/opencode` and `chmod +x` it:
+
+```ts
+#!/usr/bin/env bun
+import { appendFileSync } from "node:fs"
+import { spawnSync } from "node:child_process"
+
+const args = process.argv.slice(2)
+const agentIndex = args.indexOf("--agent")
+const agent = agentIndex >= 0 ? args[agentIndex + 1] : ""
+const mode = process.env.SMOKE_MODE ?? "approve"
+const task = process.env.SMOKE_TASK ?? "?"
+const emit = (text: string) =>
+  console.log(JSON.stringify({ sessionID: "ses_step", type: "text", part: { text } }))
+const commit = () => {
+  appendFileSync("work.txt", `work for #${task}\n`)
+  spawnSync("git", ["add", "work.txt"])
+  spawnSync("git", ["commit", "-m", `work for #${task}`])
+}
+
+if (agent === "plan") {
+  emit(JSON.stringify({ approved: true, summary: "lgtm", findings: [], next_action: "done" }))
+  process.exit(0)
+}
+if (mode === "noop") {
+  emit("reported without a commit")
+} else if (mode === "escalate") {
+  spawnSync("chainlink", ["issue", "comment", task, "ESCALATION: production credentials are unavailable"])
+  commit()
+  emit("committed and escalated")
+} else if (mode === "hang") {
+  commit()
+  emit("committed then hanging")
+  await Bun.sleep(300_000)
+} else if (mode === "review-only") {
+  emit("the resume should not dispatch a worker")
+} else {
+  commit()
+  emit("committed the work")
+}
+```
+
+Every event line has this shape:
+
+```json
+{"sessionID":"ses_step","type":"text","part":{"text":"..."}}
+```
+
+```bash
+ROOT=/tmp/opencode/chainlink-outcome-smoke
+rm -rf "$ROOT" && mkdir -p "$ROOT/bin" "$ROOT/state"
+# Write $ROOT/bin/opencode as described above and make it executable.
+export CHAINLINK_DB="$ROOT/db"
+export OPENCODE_LOOP_STATE_PATH="$ROOT/state/loops.json"
+export PATH="$ROOT/bin:$PATH"
+CLI="$PWD/bin/chainlink-loop"
+
+# (a) A dependent task whose blocker is still open must still end done.
+mkdir -p "$ROOT/dep" && cd "$ROOT/dep"
+git init -q && git config user.email smoke@example.com && git config user.name Smoke
+echo base > README.md && git add README.md && git commit -qm base
+A=$(chainlink issue create "Blocker stays open")
+B=$(chainlink issue create "Dependent with open blocker")
+AID=$(printf '%s' "$A" | sed -n 's/.*#\([0-9]*\).*/\1/p')
+BID=$(printf '%s' "$B" | sed -n 's/.*#\([0-9]*\).*/\1/p')
+chainlink issue block "$BID" "$AID"
+SMOKE_TASK="$BID" "$CLI" --task "$BID" --review-first never --close-if-verified --verify "test -f work.txt"
+"$CLI" status
+
+# Expected RESULT: {"state":"done",...,"outcomes":{"<BID>":"done"},...}
+# Expected status: "state: done" and the table row "#<BID>  1  done  passed".
+# `chainlink issue show $AID --json` still reports "status": "open".
+
+# (b) Kill a run after its worker commit, then resume it.
+mkdir -p "$ROOT/resume" && cd "$ROOT/resume"
+git init -q && git config user.email smoke@example.com && git config user.name Smoke
+echo base > README.md && git add README.md && git commit -qm base
+R=$(chainlink issue create "Killed then resumed")
+RID=$(printf '%s' "$R" | sed -n 's/.*#\([0-9]*\).*/\1/p')
+SMOKE_MODE=hang SMOKE_TASK="$RID" "$CLI" --task "$RID" --review-first never --no-close &
+PID=$!
+# Wait until the worker commit exists (git rev-list --count HEAD >= 2), then:
+kill -9 "$PID"
+"$CLI" status
+RUN=$("$CLI" status --json | sed -n 's/.*"run":"\([^"]*\)".*/\1/p')
+SMOKE_MODE=review-only SMOKE_TASK="$RID" "$CLI" --resume "$RUN" --review-first always --close-if-verified --verify "test -f work.txt"
+"$CLI" status
+
+# Expected status after the kill: "state: dead" and a "relaunch: chainlink-loop --resume ..." line.
+# Expected resumed RESULT: {"state":"done",...,"outcomes":{"<RID>":"done"},...}
+# Expected resumed status: "state: done"; the pre-existing commit counts because the task base
+# comes from the dead run's record, not from HEAD at resume time.
+
+# Escalation and no-change cases.
+# SMOKE_MODE=escalate ... --task <id> --review-first never --no-close
+#   -> RESULT "state":"not-done" with "approved-but-escalated".
+# SMOKE_MODE=noop ... --task <id> --review-first never --no-close
+#   -> RESULT "state":"not-done" with "approved-no-changes".
+```
+
 ## Chainlink Engine Rule
 
 This plugin supports **exactly one** Chainlink engine: the standalone `chainlink-loop` CLI (`src/chainlink-cli.ts` + `src/chainlink-process.ts`), which drives every step as a one-shot `opencode run` process. There is no LLM in the control path. Do not add a second engine, and do not add MCP support.

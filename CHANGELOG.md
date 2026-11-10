@@ -34,4 +34,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 - Treat SIGHUP like SIGTERM: finish the step, write an `interrupted` record and release the lock (#12)
 - Halt a multi-issue run at the first non-done outcome by default; `--stop-on never` keeps the old skip-and-continue policy (#14)
+- Re-verify the outcome table against the corrected classification and extend the documented end-to-end smoke with a dependent chain and kill-then-resume (#15)
 - Publish the plugin under a controlled npm scope and recheck upstream install fixes (#3)

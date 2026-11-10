@@ -145,12 +145,16 @@ Reviewer approval alone is never `done`. The CLI classifies each task from deter
 | Outcome | Meaning |
 | --- | --- |
 | `done` | Reviewer approved, new commits exist since the task's base sha, the issue is not escalated, and `--verify` passed when configured. |
-| `approved-no-changes` | Reviewer approved but no new commits were made since the task started. |
-| `approved-but-escalated` | Reviewer approved but the issue gained an escalation comment or a blocked flag. |
+| `approved-no-changes` | Reviewer approved but no new commits exist since the task's base sha. |
+| `approved-but-escalated` | Reviewer approved but the issue is explicitly blocked (flag or status), carries a `blocked`, `blocking`, `escalated` or `escalation` label, or has a blocker/escalation comment or a comment starting with `ESCALATION:`. |
 | `verify-failed` | The `--verify` command exited non-zero; its output tail became findings for the next worker attempt. |
 | `exhausted` | The attempt limit was reached without a done outcome. |
 | `crashed` | A worker or reviewer step died before delivering a result. |
 | `interrupted` | The operator sent SIGINT, SIGTERM or SIGHUP. |
+
+An ordinary dependency is not an escalation: `blocked_by` lists both open and closed blockers, so a task in a dependency chain can still be `done`. Only the explicit signals above count. A worker or reviewer escalates by adding a comment whose first line starts with `ESCALATION:` (or a comment created with `--kind blocker`); prose that merely mentions the word does not flag the task.
+
+When a run is resumed, or `--review-first auto|always` reviews work already present, the task base is the `baseSha` recorded for that task by its previous run record; without one, the merge-base with the default branch is used. Commits made before the current process started therefore count, so a resumed task with prior commits can be `done` and can close under `--close-if-verified`.
 
 The end of a run prints a task/attempts/outcome/verify table, and the same table is stored in the run record. By default the queue halts at the first task whose outcome is not `done`; use `--stop-on never` to keep the old skip-and-continue behaviour.
 
@@ -172,13 +176,13 @@ bun run src/chainlink-cli.ts --task 67 --dry-run
 
 | Flag | Meaning |
 | --- | --- |
-| `--task <ids>` | Comma-separated issue ids. `#67` is accepted and normalised to `67`. |
+| `--task <ids>` | Comma-separated issue ids. `#67` is accepted and normalised to `67`. An explicitly named task is an operator override and runs even when a dependency in `blocked_by` is still open; queue selection still uses `issue next`/`issue ready`, which return only ready tasks. |
 | `--attempts <n>` | Per-task attempt limit (default 20). |
 | `--max-tasks <n>` | Stop after this many tasks. |
 | `--no-close` | Leave approved issues open. Default is to close them. |
 | `--close-if-verified` | Close an issue only when its outcome is `done` and `--verify` passed; otherwise leave it open. |
 | `--stop-on non-done\|never` | Halt at the first non-done outcome (default), or keep skipping and continuing (`never`). |
-| `--resume <runId>` | Resume the remaining tasks from a run record. `status` prints the exact command for a dead run. |
+| `--resume <runId>` | Resume the remaining tasks from a run record. Prior commits count because the task base comes from the record; `status` prints the exact command for a dead run. |
 | `--verify <cmd>` | Acceptance command run in the worktree after reviewer approval. Exit 0 is required for `done`; a failure is fed back to the worker as findings. |
 | `--review-first auto\|always\|never` | Review work that already exists before dispatching a fresh worker (default `auto`). |
 | `--exclude <ids>` | Skip these issue subtrees when selecting ready tasks after an exhausted issue. |
@@ -196,9 +200,9 @@ The loop per task:
 1. `opencode run --standalone --auto --agent build "<issue spec>"` — a fresh worker process.
 2. `opencode run --standalone --auto --agent plan "<review prompt>"` — a fresh reviewer process that returns the verdict JSON. The `plan` agent cannot write outside its plan directory, so a reviewer cannot edit the tree even under `--auto`; the plugin also denies edit/write/patch requests raised by a reviewer session.
 3. If not approved, the findings go back to the **same worker session** via `--session <id>`, so context is kept. Repeat until approval or the attempt limit.
-4. Close the issue only on approval and only when closing is enabled.
+4. Close the issue only on a `done` outcome and only when closing is enabled; a non-done outcome leaves it open for a human.
 
-`--review-first auto` looks for a dirty tree, commits that mention the issue, a previous Chainlink workflow for the same task, or comments on the issue. If any are found, the reviewer runs **first** so a previous attempt's work is judged rather than thrown away.
+`--review-first auto` looks for a dirty tree, commits that mention the issue, a previous Chainlink workflow for the same task, or comments on the issue. If any are found, the reviewer runs **first** so a previous attempt's work is judged rather than thrown away. The task base is then the baseSha recorded by the previous run (or the merge-base with the default branch), so those existing commits count toward `done`.
 
 **One loop per workspace.** The loop takes a lock keyed by working directory and `CHAINLINK_DB` (`$TMPDIR/chainlink-loop-*.lock`) so a second invocation fails loudly instead of dispatching two workers at the same files. A lock whose owning process is gone is taken over automatically. `SIGINT`/`SIGTERM`/`SIGHUP` stop the loop, kill the in-flight step's process group, write a terminal `interrupted` run record, and release the lock; a second signal exits immediately.
 
