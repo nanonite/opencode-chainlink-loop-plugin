@@ -741,8 +741,8 @@ var injectedVersion = readString("0.3.1");
 var BUILD_INFO = {
   name: PLUGIN_NAME,
   version: injectedVersion ?? "0.0.0-dev",
-  gitDescribe: readString("v0.1.8-54-gbc3e529"),
-  gitSha: readString("bc3e529"),
+  gitDescribe: readString("v0.1.8-55-gd6f10bd"),
+  gitSha: readString("d6f10bd"),
   gitDirty: true,
   source: injectedVersion ? "build" : "dev"
 };
@@ -1441,7 +1441,7 @@ async function runProcessInnerLoop(options, workflow, task) {
   let workerOutput = "";
   let existingWork = false;
   let pendingReview = null;
-  const detection = await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID));
+  const detection = options.reviewFirst === "never" ? { existing: false, reason: "review-first is off" } : await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID));
   const reviewFirst = options.reviewFirst === "always" || options.reviewFirst === "auto" && detection.existing;
   const baseSha = await resolveTaskBaseSha(options, task, detection.existing || reviewFirst || options.resumeRecord != null);
   const emit = async (event) => {

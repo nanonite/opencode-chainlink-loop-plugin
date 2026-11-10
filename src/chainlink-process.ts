@@ -619,7 +619,10 @@ export async function runProcessInnerLoop(
   let existingWork = false
   let pendingReview: ChainlinkReview | null = null
 
-  const detection = await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID))
+  const detection =
+    options.reviewFirst === "never"
+      ? { existing: false, reason: "review-first is off" }
+      : await detectExistingWork(options.cwd, task, await listChainlinkWorkflows(options.ownerSessionID))
   const reviewFirst = options.reviewFirst === "always" || (options.reviewFirst === "auto" && detection.existing)
   const baseSha = await resolveTaskBaseSha(
     options,

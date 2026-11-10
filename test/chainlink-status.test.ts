@@ -212,18 +212,32 @@ sleep 30
   await writeFile(join(binDir, "opencode"), opencode, { mode: 0o755 })
 }
 
-async function waitForRecord() {
+type RunRecordShape = {
+  status?: string
+  current?: { step?: string } | null
+  [key: string]: unknown
+}
+
+async function waitForRecord(): Promise<RunRecordShape> {
+  let lastRecord: RunRecordShape | null = null
   for (let attempt = 0; attempt < 200; attempt += 1) {
     try {
       const names = await readdir(runsDirectory())
       const name = names.find((candidate) => candidate.endsWith(".json"))
-      if (name) return JSON.parse(await readFile(join(runsDirectory(), name), "utf8"))
+      if (name) {
+        const record = JSON.parse(await readFile(join(runsDirectory(), name), "utf8")) as RunRecordShape
+        lastRecord = record
+        // A run now legitimately sits in "selecting" while it decides whether
+        // prior work exists; the signal tests need the record after the worker
+        // step has started.
+        if (record.current?.step === "worker") return record
+      }
     } catch {
       // directory not created yet
     }
     await Bun.sleep(20)
   }
-  throw new Error("run record did not appear")
+  throw new Error(`run record did not reach the worker step: ${JSON.stringify(lastRecord)}`)
 }
 
 async function runSignalCase(signal: NodeJS.Signals) {
