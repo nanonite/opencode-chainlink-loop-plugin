@@ -28,7 +28,7 @@ Choose the instructions that match the CLI you run:
 | OpenCode version | How to identify it | Instructions |
 | --- | --- | --- |
 | OpenCode 1 stable | You run `opencode` and `opencode --version` prints `1.x` | [OpenCode 1](#opencode-1-stable) |
-| OpenCode 2 preview | You run `opencode2` | [OpenCode 2](#opencode-2-preview) |
+| OpenCode 2 | You run `opencode` and `opencode --version` prints `2.x` | [OpenCode 2](#opencode-2) |
 
 Do not mix the configuration formats. OpenCode 1 uses `plugin` and `tui.json`; OpenCode 2 uses `plugins` and the global `~/.config/opencode/cli.json`.
 
@@ -64,9 +64,9 @@ OpenCode detects both package entrypoints and writes the plugin into the server 
 }
 ```
 
-### OpenCode 2 Preview
+### OpenCode 2
 
-This plugin supports OpenCode 2 preview `0.0.0-next-17055` while remaining compatible with OpenCode 1. Add the package to both V2 plugin lists.
+This plugin supports OpenCode 2.3 and later while remaining compatible with OpenCode 1. Add the package to the OpenCode 2 plugin list.
 
 `opencode.json`:
 
@@ -76,7 +76,9 @@ This plugin supports OpenCode 2 preview `0.0.0-next-17055` while remaining compa
 }
 ```
 
-`~/.config/opencode/cli.json`:
+Starting with OpenCode 2.3, one plugin entry loads every part. The server hooks and tools come from the package's `./server` export, and the sidebar and `Loops` command come from its `./tui` export. You only need `~/.config/opencode/cli.json` when the TUI connects to a remote server or when you install a TUI-only plugin.
+
+`~/.config/opencode/cli.json` (optional for this plugin):
 
 ```json
 {
@@ -84,11 +86,11 @@ This plugin supports OpenCode 2 preview `0.0.0-next-17055` while remaining compa
 }
 ```
 
-OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint is loaded from `opencode.json`; the sidebar and the `Loops` command are loaded from the global `~/.config/opencode/cli.json`.
+OpenCode 2 does not read the V1 `tui.json` file.
 
-The sidebar renders the focused session's active loops. Press `Ctrl+L` to open the loop actions (refresh, run, pause, resume, stop); selecting one sends the matching loop tool call to the agent. OpenCode 2.0.16 does not surface plugin commands in the `Ctrl+P` command palette, so `Ctrl+L` is the entrypoint there.
+The sidebar renders the focused session's active loops. Press `Ctrl+L` to open the loop actions (refresh, run, pause, resume, stop); selecting one sends the matching loop tool call to the agent.
 
-The OpenCode 2 plugin API is still in preview. This release targets the exact preview above; later previews may require a plugin update. V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, and TUI sidebar/palette integration. The dedicated V1 compaction-context hook has no V2 equivalent in this preview. V2 still injects the active-loop system reminder before model dispatch, but cannot append the separate loop block directly to a compaction operation.
+V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, and TUI sidebar/action integration. The dedicated V1 compaction-context hook has no V2 equivalent, so V2 injects the active-loop system reminder before model dispatch but cannot append the separate loop block directly to a compaction operation.
 
 ## Usage
 
@@ -246,7 +248,7 @@ In OpenCode 1, server options use the package-and-options tuple in `opencode.jso
 }
 ```
 
-In OpenCode 2, use the plugin object form:
+In OpenCode 2, use the plugin object form. OpenCode 2.3 rejects the V1 tuple form (`[package, options]`) during config normalization, so the object form is required for plugin options:
 
 ```json
 {
@@ -368,4 +370,4 @@ OpenCode plugin modules are target-specific. This package exports separate modul
 }
 ```
 
-Claude Code's `/loop` has deeper runtime integration (cron scheduling, cache-aware wake-ups, event monitors). This plugin implements the same workflow with OpenCode plugin hooks: timers on the server plugin, idle detection through `session.status` / `session.idle` events, and prompt injection through `session.promptAsync`. The TUI sidebar reads loop state from the plugin's tool outputs in the session, so it works without a private channel between the TUI and the server.
+Claude Code's `/loop` has deeper runtime integration (cron scheduling, cache-aware wake-ups, event monitors). This plugin implements the same workflow with OpenCode plugin hooks: timers on the server plugin, idle detection through OpenCode's execution lifecycle events (`session.execution.*` on 2.3+, with `session.status` / `session.idle` as the legacy fallback), and prompt injection through the session prompt API. The TUI sidebar reads loop state from the plugin's tool outputs in the session, so it works without a private channel between the TUI and the server.

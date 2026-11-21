@@ -559,7 +559,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const dynamicPending = new Map<string, { sessionID: string; sawBusy: boolean }>()
   const registrations: Array<{ dispose(): Promise<void> }> = []
 
-  v2Log("info", `opencode-loop-plugin ${formatBuildInfo()} loaded`, { ...BUILD_INFO })
+  v2Log("info", `opencode-loop-plugin ${formatBuildInfo()} loaded`, {
+    ...BUILD_INFO,
+    location: context.location,
+  })
 
   const isRestrictedAgent = (agent: string | null | undefined) =>
     typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase())
@@ -723,28 +726,41 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
     if (!sessionID) return
     observedSessions.add(sessionID)
+
+    const markBusy = () => {
+      busySessions.add(sessionID)
+      for (const pending of dynamicPending.values()) {
+        if (pending.sessionID === sessionID) pending.sawBusy = true
+      }
+    }
+    const markIdle = async () => {
+      busySessions.delete(sessionID)
+      await settleDynamicLoops(sessionID)
+      await runDueForSession(sessionID)
+    }
+
     switch (event.type) {
+      // OpenCode 2.3+ reports the user-turn lifecycle as execution events.
+      case "session.execution.started": {
+        markBusy()
+        return
+      }
+      case "session.execution.succeeded":
+      case "session.execution.failed":
+      case "session.execution.interrupted": {
+        await markIdle()
+        return
+      }
+      // Older OpenCode 2 builds used session.status/session.idle.
       case "session.status": {
         const status = data.status
-        if (isRecord(status) && typeof status.type === "string") {
-          if (status.type === "busy") {
-            busySessions.add(sessionID)
-            for (const pending of dynamicPending.values()) {
-              if (pending.sessionID === sessionID) pending.sawBusy = true
-            }
-          }
-          if (status.type === "idle") {
-            busySessions.delete(sessionID)
-            await settleDynamicLoops(sessionID)
-            await runDueForSession(sessionID)
-          }
-        }
+        if (!isRecord(status) || typeof status.type !== "string") return
+        if (status.type === "busy") markBusy()
+        if (status.type === "idle") await markIdle()
         return
       }
       case "session.idle": {
-        busySessions.delete(sessionID)
-        await settleDynamicLoops(sessionID)
-        await runDueForSession(sessionID)
+        await markIdle()
         return
       }
       case "session.deleted": {

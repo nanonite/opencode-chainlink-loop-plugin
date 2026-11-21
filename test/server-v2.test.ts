@@ -365,6 +365,39 @@ test("V2 busy/idle events defer and then inject loop iterations", async () => {
   await cleanup()
 })
 
+test("V2 execution lifecycle events drive busy and idle on OpenCode 2.3+", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  const created = JSON.parse(
+    contentOf(await loopTool(mock, "create_loop").execute({ instruction: "say tick", interval: "1s" }, toolContext())),
+  ) as { created: string }
+  mock.activeSessions.add("ses_v2")
+  mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await sleep(1300)
+  expect(mock.promptCalls).toHaveLength(0)
+  expect((await getLoop(created.created))?.lastResult).toBe("skipped_busy")
+  mock.activeSessions.delete("ses_v2")
+  mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length >= 1)
+  expect(mock.promptCalls[0]?.text).toContain(created.created)
+  await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
+  mock.stream.end()
+  await cleanup()
+})
+test("V2 dynamic loops settle on a failed or interrupted execution", async () => {
+  for (const type of ["session.execution.failed", "session.execution.interrupted"]) {
+    const mock = makeMockContext()
+    const cleanup = await plugin.setup(mock as never)
+    const created = JSON.parse(
+      contentOf(await loopTool(mock, "create_loop").execute({ instruction: "watch CI" }, toolContext())),
+    ) as { created: string }
+    mock.stream.push({ type, created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(created.created))?.status === "stopped")
+    expect((await getLoop(created.created))?.stopReason).toContain("without scheduling")
+    mock.stream.end()
+    await cleanup()
+  }
+})
 test("V2 authoritative session state overrides a stale busy event", async () => {
   const mock = makeMockContext()
   const cleanup = await plugin.setup(mock as never)

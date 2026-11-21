@@ -22,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Add the TUI sidebar/palette for the loop plugin (cli.json) (#2)
 
 ### Fixed
+- Fix the server plugin failing to load on OpenCode 2.3 with `Schema.optionalWith is not a function`: Effect 3 is now bundled into `dist/server.js`, so OpenCode's Effect 4 runtime no longer replaces it
+- Fix scheduler idle detection on OpenCode 2.3 by handling `session.execution.started` and `session.execution.succeeded` / `failed` / `interrupted`, with `session.status` / `session.idle` kept as the legacy fallback
 - Fix outcome classification so an ordinary `blocked_by` dependency is not an escalation and only an explicit blocked flag/status, blocking label, blocker/escalation comment kind, or a comment starting with `ESCALATION:` flags a task (#13)
 - Fix resumed and review-first runs counting zero commits by taking the task base from the previous run record's `baseSha` (falling back to the default-branch merge-base), so prior commits reach `done` and can close under `--close-if-verified` (#13)
 - Cover `--resume` over pre-existing commits and tasks with an open dependency reaching `done` and closing under `--close-if-verified` at the backlog level (#14)
@@ -33,6 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix extractReview discarding genuine reviewer approvals when prose with brackets precedes the JSON verdict (#4)
 
 ### Changed
+- Target OpenCode 2.3.2: refresh the `@opencode-ai/plugin-v2`/`@opencode-ai/theme` dev dependencies to beta-19271, load the TUI part from the server plugin entry, and document the plugin object options form
 - Treat SIGHUP like SIGTERM: finish the step, write an `interrupted` record and release the lock (#12)
 - Halt a multi-issue run at the first non-done outcome by default; `--stop-on never` keeps the old skip-and-continue policy (#14)
 - Re-verify the outcome table against the corrected classification and extend the documented end-to-end smoke with a dependent chain and kill-then-resume (#15)

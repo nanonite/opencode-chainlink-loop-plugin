@@ -97,7 +97,11 @@ const defineArgs = (
 
 type Target = "all" | "server" | "cli"
 
-const serverExternals = ["@opencode-ai/plugin", "effect", "zod"]
+// Effect must be bundled into the server plugin: OpenCode 2.3.x installs
+// Effect 4 for its own runtime and resolves a plugin's bare `effect` import to
+// that copy, where the Effect 3 `Schema.optionalWith` API does not exist.
+// Bundling keeps the plugin on the Effect 3 API declared in package.json.
+const serverExternals = ["@opencode-ai/plugin", "zod"]
 const cliExternals = ["effect", "zod"]
 
 function build(target: Exclude<Target, "all">) {

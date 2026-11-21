@@ -6,7 +6,7 @@ This package is an OpenCode plugin with separate server and TUI entrypoints:
 
 - `src/server.ts` is the server plugin. It registers the `/loop` command, the loop tools, chat/session hooks, compaction context, and the scheduler that injects loop iterations while a session is idle.
 - `src/state.ts` owns loop persistence and lifecycle state. It stores JSON at `OPENCODE_LOOP_STATE_PATH` when set, otherwise under the user's OpenCode data location. It also owns interval parsing/formatting.
-- `src/tui.tsx` is the Solid/OpenTUI sidebar and loop-actions UI. The `Loops` command is bound to `Ctrl+L`; OpenCode 2.0.16 does not list plugin commands in the `Ctrl+P` palette, so keep the keybind. It is exported as source, so avoid adding heavy runtime dependencies here unless there is a strong reason.
+- `src/tui.tsx` is the Solid/OpenTUI sidebar and loop-actions UI. The `Loops` command is bound to `Ctrl+L`; keep the keybind because `Ctrl+P` palette support varies by OpenCode build. It is exported as source, so avoid adding heavy runtime dependencies here unless there is a strong reason.
 - `src/prompts.ts` contains the `/loop` command template, the per-iteration synthetic prompt, the loop system reminder, and the compaction context.
 - `test/` covers state, server hooks/tools/scheduler, and TUI helpers with Bun tests. Scheduler tests use 1-second intervals via the `min_interval_seconds` option.
 
@@ -22,11 +22,11 @@ This package is an OpenCode plugin with separate server and TUI entrypoints:
 
 - Preserve the public Promise-based state API (`createLoop`, `listLoops`, `stopLoop`, `recordRunSent`, etc.) because OpenCode hooks and tests call it directly.
 - Keep `zod` pinned to the exact version `@opencode-ai/plugin` depends on; tool argument schemas fail typechecking across zod minor versions.
-- Effect is intentionally used in the state/persistence boundary. Do not spread Effect into the TUI.
+- Effect is intentionally used in the state/persistence boundary. Do not spread Effect into the TUI. The server bundle must bundle Effect: OpenCode 2.3 resolves a plugin's bare `effect` import to its own Effect 4 runtime, where the Effect 3 `Schema.optionalWith` API is missing.
 - State writes should remain atomic: write to a temp file, then `rename` into place.
 - Use `OPENCODE_LOOP_STATE_PATH` for tests and smoke runs so you do not touch a real user's loop state.
 - All loop tools return `{ ..., loops }` for the session; the TUI sidebar parses that shape from tool outputs, so keep it stable.
-- Keep the repository-root `index.js` and `tui.tsx` entrypoints and the committed `dist/` output in sync; OpenCode 2 loads this checkout directory through `index.js` for the server plugin and `tui.tsx` for the CLI/TUI plugin.
+- Keep the repository-root `index.js` and `tui.tsx` entrypoints and the committed `dist/` output in sync. OpenCode 2.3 loads this checkout directory through `index.js` for the server plugin and through the package's `./tui` export (`src/tui.tsx`) for the CLI/TUI plugin; the root files remain the fallback for older 2.x builds.
 
 ## Local Validation
 
@@ -68,9 +68,34 @@ OPENCODE_LOOP_STATE_PATH="/tmp/opencode-loop-plugin-smoke/loops.json" opencode r
 
 The smoke test should show `create_loop` (and possibly `stop_loop`) tool calls. Inspect the state file afterward to confirm JSON persistence, and clean up with `/loop stop <id>` or by deleting the smoke state file.
 
-To test the CLI/TUI entrypoint locally, add the same checkout directory to the global `~/.config/opencode/cli.json` `plugins` list and open the TUI (`opencode2 --standalone`). Confirm the debug log shows `entrypoint=.../tui.tsx` and `stage=setup plugin=local.loop-mode.tui` for `role=cli`, the sidebar renders active loops, and `Ctrl+L` opens the loop-actions dialog. OpenCode 2.0.16 does not auto-load a directory plugin's TUI component from the server plugin list, so `cli.json` must list the checkout directory explicitly.
+To test the CLI/TUI entrypoint locally, list the checkout in the project `opencode.json` and open the TUI (`opencode --standalone`). OpenCode 2.3 auto-loads the package's `./tui` export (`src/tui.tsx`) from that same entry; add the checkout to `~/.config/opencode/cli.json` only when testing against a remote server or an older 2.x build. Confirm the debug log shows `entrypoint=.../src/tui.tsx` and `stage=setup plugin=local.loop-mode.tui` for `role=cli`, the sidebar renders active loops, and `Ctrl+L` opens the loop-actions dialog.
 
-OpenCode 2 loads a configured plugin directory through an `index.js`/`index.ts` entrypoint for the server and a `tui.tsx`/`tui.ts` entrypoint for the CLI, so keep the repository-root `index.js` and `tui.tsx` in place. Configured file paths are rejected and Git specifiers for packages with build scripts fail on OpenCode 2.0.16 (upstream opencode issues 49704 and 46551).
+OpenCode 2.3 uses `session.execution.started` and `session.execution.succeeded` / `failed` / `interrupted` for turn lifecycle events. The V2 handler also accepts the older `session.status` / `session.idle` names.
+
+To exercise the scheduler, keep a standalone server alive so a loop can fire while the session is idle. Use plugin options in the object form; OpenCode 2.3 rejects the V1 tuple form:
+
+```bash
+ROOT=/tmp/opencode/loop-scheduler-smoke
+mkdir -p "$ROOT/config/opencode" "$ROOT/work"
+cat > "$ROOT/config/opencode/opencode.json" <<'JSON'
+{
+  "plugins": [
+    { "package": "file:///path/to/opencode-chainlink-loop-plugin", "options": { "min_interval_seconds": 1 } }
+  ]
+}
+JSON
+cd "$ROOT/work"
+XDG_CONFIG_HOME="$ROOT/config" OPENCODE_PASSWORD=smoke OPENCODE_LOOP_STATE_PATH="$ROOT/loops.json" \
+  opencode serve --port 4789 --print-logs --log-level info > "$ROOT/server.log" 2>&1 &
+opencode run --server http://127.0.0.1:4789 --format json \
+  "Call create_loop with instruction 'say exactly tick' and interval '1s'. Do not stop the loop."
+sleep 3
+cat "$ROOT/loops.json"   # runCount should advance while the server stays up
+```
+
+Stop the server and delete `$ROOT` when done.
+
+OpenCode 2 loads a configured plugin directory through an `index.js`/`index.ts` entrypoint for the server and the package's `./tui` export for the CLI, so keep the repository-root `index.js` and `tui.tsx` files in place for older 2.x builds.
 
 ### Chainlink outcome smoke (built CLI)
 
